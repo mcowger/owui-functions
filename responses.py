@@ -2334,7 +2334,7 @@ async def handle_code_interpreter_event(
                 "code_interpreter.event completed output_index=%s",
                 _get_attr(event, "output_index"),
             )
-        await emit_status("Code interpreter run finished.", require_previous=True)
+        await emit_status("Code interpreter run finished.", done=True, require_previous=True)
         return False
 
     return False
@@ -2760,6 +2760,8 @@ _SERVER_SIDE_TOOL_TYPES = {
     "computer_call",
 }
 
+_TERMINAL_TOOL_STATUS_PHASES = {"done", "completed", "failed"}
+
 
 def _server_tool_event_phase(event_type: str | None) -> tuple[str, str] | None:
     """Return (tool_type, phase) for Responses API server-side tool events."""
@@ -2888,7 +2890,12 @@ async def _emit_server_tool_status(
     state.server_tool_status_keys.add(key)
 
     try:
-        await events.status(description, done=False)
+        normalized_phase = (phase or "").lower()
+        await events.status(
+            description,
+            done=normalized_phase in _TERMINAL_TOOL_STATUS_PHASES,
+            level="error" if normalized_phase == "failed" else "info",
+        )
     except Exception:
         logger.debug("Failed to emit server-side tool status", exc_info=True)
 
