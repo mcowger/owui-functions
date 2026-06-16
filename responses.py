@@ -2935,9 +2935,7 @@ class ResponsesEngine:
                     )
                     break
 
-                names = ", ".join(f"`{c.name}`" for c in tool_calls)
                 tool_results = await tool_executor.execute(tool_calls)
-                await events.status(f"Called tool{'' if len(tool_calls) == 1 else 's'} {names}", done=True)
                 state.tool_calls_executed += len(tool_results)
 
                 # Emit each tool call as a collapsible <details type="tool_calls"> block
