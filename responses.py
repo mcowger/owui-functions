@@ -3162,31 +3162,30 @@ class ResponsesEngine:
                 url = annotation.get("url")
                 if not url:
                     return None
-
                 url = _strip_tracking_params(url)
-                source_name = _host_from_url(url) or "source"
-                title = annotation.get("title") or url
+                # Only emit once per unique URL.
                 if url not in state.citation_ordinals:
                     state.citation_ordinals[url] = len(state.citation_ordinals) + 1
-                ordinal = state.citation_ordinals[url]
-                citation = Citation(
-                    source_name=source_name,
-                    url=url,
-                    document=[title],
-                    metadata={
-                        "source": url,
-                        "date_accessed": datetime.date.today().isoformat(),
-                        "ordinal": ordinal,
-                    },
-                )
-                state.citations.append(citation)
-                payload = {
-                    "source": {"name": citation.source_name, "url": citation.url},
-                    "document": citation.document,
-                    "metadata": [citation.metadata],
-                }
-                await events.source(payload)
-                await events.citation(payload)
+                    source_name = _host_from_url(url) or "source"
+                    title = annotation.get("title") or url
+                    citation = Citation(
+                        source_name=source_name,
+                        url=url,
+                        document=[title],
+                        metadata={
+                            "source": url,
+                            "date_accessed": datetime.date.today().isoformat(),
+                            "ordinal": state.citation_ordinals[url],
+                        },
+                    )
+                    state.citations.append(citation)
+                    payload = {
+                        "source": {"name": citation.source_name, "url": citation.url},
+                        "document": citation.document,
+                        "metadata": [citation.metadata],
+                    }
+                    await events.source(payload)
+                    await events.citation(payload)
             return None
 
         if isinstance(event, (ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent)):
@@ -3215,6 +3214,36 @@ class ResponsesEngine:
                         events=events,
                         logger=self._logger,
                     )
+                    # Emit all sources from web_search_call.action.sources
+                    if item_type == "web_search_call" and isinstance(event, ResponseOutputItemDoneEvent):
+                        action = item.get("action") if isinstance(item.get("action"), dict) else {}
+                        for src in (action.get("sources") or []):
+                            if not isinstance(src, dict):
+                                continue
+                            url = _strip_tracking_params(src.get("url") or "")
+                            if not url or url in state.citation_ordinals:
+                                continue
+                            state.citation_ordinals[url] = len(state.citation_ordinals) + 1
+                            title = src.get("title") or url
+                            source_name = _host_from_url(url) or "source"
+                            citation = Citation(
+                                source_name=source_name,
+                                url=url,
+                                document=[title],
+                                metadata={
+                                    "source": url,
+                                    "date_accessed": datetime.date.today().isoformat(),
+                                    "ordinal": state.citation_ordinals[url],
+                                },
+                            )
+                            state.citations.append(citation)
+                            payload = {
+                                "source": {"name": source_name, "url": url},
+                                "document": [title],
+                                "metadata": [citation.metadata],
+                            }
+                            await events.source(payload)
+                            await events.citation(payload)
                 if isinstance(event, ResponseOutputItemDoneEvent):
                     self._record_structured_item(item, state, ctx.runtime_config)
             return None
