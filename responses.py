@@ -2903,7 +2903,10 @@ class ResponsesEngine:
                 await self._emit_routing_status(request.model_router_result, events)
                 request.model_router_result = None
 
-            for _ in range(cfg.MAX_FUNCTION_CALL_LOOPS):
+            # Each iteration streams one response and executes any tool calls.
+            # We need MAX_FUNCTION_CALL_LOOPS tool-call iterations PLUS one final
+            # response to get the model's text answer, so range is +1.
+            for loop_iteration in range(cfg.MAX_FUNCTION_CALL_LOOPS + 1):
                 response = await self._stream_single_response(
                     request=request,
                     ctx=ctx,
@@ -2918,6 +2921,13 @@ class ResponsesEngine:
 
                 tool_calls = self._extract_tool_calls(response)
                 if not tool_calls:
+                    break
+
+                if loop_iteration >= cfg.MAX_FUNCTION_CALL_LOOPS:
+                    await events.status(
+                        f"Tool call limit ({cfg.MAX_TOOL_CALLS}) reached. Stopping further tool calls.",
+                        done=False,
+                    )
                     break
 
                 if cfg.MAX_TOOL_CALLS is not None and (
