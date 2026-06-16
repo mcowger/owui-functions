@@ -3131,7 +3131,20 @@ class ResponsesEngine:
 
         if isinstance(event, ResponseReasoningSummaryTextDoneEvent):
             if event.text:
-                await events.status(event.text, done=False)
+                import html as _html
+                escaped = "\n".join(
+                    f"> {_html.escape(line)}" if not line.startswith(">") else _html.escape(line)
+                    for line in event.text.splitlines()
+                )
+                block = (
+                    f'<details type="reasoning" done="true">\n'
+                    f"<summary>Thought</summary>\n"
+                    f"{escaped}\n"
+                    f"</details>\n"
+                )
+                state.assistant_visible_text += block
+                state.assistant_internal_text += block
+                await events.delta(block)
             return None
 
         if isinstance(event, ResponseOutputTextAnnotationAddedEvent):
