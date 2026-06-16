@@ -2895,7 +2895,7 @@ class ResponsesEngine:
         final_text: str = ""
 
         try:
-            await events.status("Calling OpenAI Responses API…", done=False)
+            await events.status("Calling OpenAI Responses API…", done=False, hidden=True)
         except Exception:
             self._logger.debug("Failed to emit start status", exc_info=True)
 
@@ -3014,7 +3014,7 @@ class ResponsesEngine:
                 if state.error_message:
                     await events.status(state.error_message, done=True, level="error")
                 else:
-                    await events.status("Response complete.", done=True)
+                    await events.status("Response complete.", done=True, hidden=True)
             except Exception:
                 self._logger.debug("Failed to emit terminal status", exc_info=True)
 
@@ -3080,7 +3080,7 @@ class ResponsesEngine:
             if first_event:
                 first_event = False
                 try:
-                    await events.status("Streaming response from model…", done=False)
+                    await events.status("Streaming response from model…", done=False, hidden=True)
                 except Exception:
                     self._logger.debug("Failed to emit streaming status", exc_info=True)
             response_payload = await self._handle_event(event, state, events, ctx)
