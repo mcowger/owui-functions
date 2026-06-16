@@ -1401,6 +1401,7 @@ class TurnState:
     pending_ci_results: set[int] = field(default_factory=set)
     pending_ci_code_snippets: dict[int, str] = field(default_factory=dict)
     server_tool_status_keys: set[str] = field(default_factory=set)
+    current_output_item_type: str | None = None  # type of the active output item
 
 
 @dataclass
@@ -3117,11 +3118,15 @@ class ResponsesEngine:
             return None
 
         if isinstance(event, ResponseOutputTextDeltaEvent):
-            delta = event.delta or ""
-            if delta:
-                state.assistant_visible_text += delta
-                state.assistant_internal_text += delta
-                await events.delta(delta)
+            # Only emit deltas that belong to a message item (the final text
+            # response). Deltas during reasoning or function_call items are
+            # internal and should not appear in the chat content.
+            if state.current_output_item_type == "message":
+                delta = event.delta or ""
+                if delta:
+                    state.assistant_visible_text += delta
+                    state.assistant_internal_text += delta
+                    await events.delta(delta)
             return None
 
         if isinstance(event, ResponseReasoningSummaryTextDoneEvent):
@@ -3166,6 +3171,10 @@ class ResponsesEngine:
             item = event.item or {}
             if item:
                 item_type = str(item.get("type") or "")
+                if isinstance(event, ResponseOutputItemAddedEvent):
+                    state.current_output_item_type = item_type
+                elif isinstance(event, ResponseOutputItemDoneEvent):
+                    state.current_output_item_type = None
                 if item.get("type") == "code_interpreter_call":
                     await handle_code_interpreter_item(
                         item,
