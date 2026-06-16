@@ -2944,13 +2944,7 @@ class ResponsesEngine:
                 tool_results = await tool_executor.execute(tool_calls)
                 state.tool_calls_executed += len(tool_results)
 
-                # Emit tool call detail blocks so Open WebUI renders the
-                # expandable input/output UI (same format as the Anthropic pipe).
-                for call, result in zip(tool_calls, tool_results):
-                    block = self._format_tool_call_block(call, result)
-                    state.assistant_visible_text += block
-                    state.assistant_internal_text += block
-                    await events.delta(block)
+
                 call_items = self._extract_function_call_items(response)
                 result_items = self._tool_results_to_output_items(tool_results)
                 # Persist both the function_call and function_call_output items
@@ -3253,24 +3247,6 @@ class ResponsesEngine:
             item for item in (response.get("output") or [])
             if isinstance(item, dict) and item.get("type") in {"reasoning", "function_call"}
         ]
-
-    @staticmethod
-    def _format_tool_call_block(call: ToolCall, result: ToolResult) -> str:
-        """Render a tool call + result as an Open WebUI <details type="tool_calls"> block.
-
-        This matches the format emitted by the Anthropic pipe, which Open WebUI
-        parses to show the expandable tool input/output UI.
-        """
-        import html as _html
-        args = _html.escape(call.arguments_json)
-        output = _html.escape(result.output or "")
-        return (
-            f'<details type="tool_calls" done="true" id="{_html.escape(call.call_id)}" '
-            f'name="{_html.escape(call.name)}" arguments="{args}" '
-            f'result="{output}" files="" embeds="">\n'
-            f"<summary>Tool Executed</summary>\n"
-            f"</details>\n"
-        )
 
     def _tool_results_to_output_items(self, results: list[ToolResult]) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
