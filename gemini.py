@@ -96,21 +96,16 @@ class PipeValves(BaseModel):
         default=False,
         description="If enabled, requests BLOCK_NONE for standard Gemini text safety categories.",
     )
-    USE_GOOGLE_SEARCH: bool = Field(
-        default=True,
-        description="If enabled, adds the Google Search grounding tool to every request.",
-    )
-    USE_GOOGLE_MAPS: bool = Field(
-        default=False,
-        description="If enabled, adds the Google Maps tool to every request.",
-    )
-    USE_URL_CONTEXT: bool = Field(
-        default=True,
-        description="If enabled, Gemini will automatically fetch URLs mentioned in prompts.",
-    )
-    USE_CODE_EXECUTION: bool = Field(
-        default=False,
-        description="If enabled, Gemini can write and execute Python in a sandboxed environment on Google's servers.",
+    SERVER_TOOL_MODE: Literal["search", "search_code", "maps", "code", "none"] = Field(
+        default="search",
+        description=(
+            "Which server-side Gemini tools to enable. "
+            "'search' = Google Search + URL Context (default). "
+            "'search_code' = Google Search + URL Context + Code Execution. "
+            "'maps' = Google Maps + URL Context. "
+            "'code' = Code Execution only. "
+            "'none' = no server-side tools."
+        ),
     )
     MAX_TOOL_CALLS: int = Field(
         default=30,
@@ -151,10 +146,9 @@ class UserValves(BaseModel):
     )
     THINKING_BUDGET: int | None = Field(default=None)
     INCLUDE_THOUGHTS: Literal["true", "false", "INHERIT"] = Field(default="INHERIT")
-    USE_GOOGLE_SEARCH: Literal["true", "false", "INHERIT"] = Field(default="INHERIT")
-    USE_GOOGLE_MAPS: Literal["true", "false", "INHERIT"] = Field(default="INHERIT")
-    USE_URL_CONTEXT: Literal["true", "false", "INHERIT"] = Field(default="INHERIT")
-    USE_CODE_EXECUTION: Literal["true", "false", "INHERIT"] = Field(default="INHERIT")
+    SERVER_TOOL_MODE: Literal["search", "search_code", "maps", "code", "none", "INHERIT"] = Field(
+        default="INHERIT"
+    )
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "INHERIT"] = Field(
         default="INHERIT"
     )
@@ -195,15 +189,27 @@ def merge_valves(pipe_valves: PipeValves, user_valves: UserValves) -> RuntimeCon
     if include_thoughts not in (None, "INHERIT"):
         data["INCLUDE_THOUGHTS"] = include_thoughts == "true"
 
-    for key in ("USE_GOOGLE_SEARCH", "USE_GOOGLE_MAPS", "USE_URL_CONTEXT", "USE_CODE_EXECUTION"):
-        val = overrides.get(key)
-        if val not in (None, "INHERIT"):
-            data[key] = val == "true"
+    if overrides.get("SERVER_TOOL_MODE") not in (None, "INHERIT"):
+        data["SERVER_TOOL_MODE"] = overrides["SERVER_TOOL_MODE"]
 
     if overrides.get("LOG_LEVEL") not in (None, "INHERIT"):
         data["LOG_LEVEL"] = overrides["LOG_LEVEL"]
 
     return RuntimeConfig(**data)
+
+
+def _resolve_server_tools(mode: str) -> tuple[bool, bool, bool, bool]:
+    """Return (google_search, google_maps, url_context, code_execution) for a mode."""
+    if mode == "search":
+        return True, False, True, False
+    if mode == "search_code":
+        return True, False, True, True
+    if mode == "maps":
+        return False, True, True, False
+    if mode == "code":
+        return False, False, False, True
+    # "none" or unknown
+    return False, False, False, False
 
 
 def _get_logger(level_name: str) -> logging.Logger:
@@ -799,11 +805,6 @@ def _build_tools(
         )
         for definition in registry.iter_definitions()
     ]
-    # Maps and Code Execution cannot be combined in the same request (API limitation).
-    # If both are enabled, drop Maps — Code Execution is the more intentional opt-in.
-    if google_maps and code_execution:
-        google_maps = False
-
     has_server_tools = google_search or google_maps or url_context
     if has_server_tools:
         # When combining server-side built-in tools with custom functions, all must
@@ -1073,10 +1074,9 @@ class Pipe:
             model_id=model_id,
         )
 
-        use_search = cfg.USE_GOOGLE_SEARCH and allow_tools
-        use_maps = cfg.USE_GOOGLE_MAPS and allow_tools
-        use_url_context = cfg.USE_URL_CONTEXT and allow_tools
-        use_code_execution = cfg.USE_CODE_EXECUTION and allow_tools
+        use_search, use_maps, use_url_context, use_code_execution = (
+            _resolve_server_tools(cfg.SERVER_TOOL_MODE) if allow_tools else (False, False, False, False)
+        )
         has_server_tools = use_search or use_maps or use_url_context
         gemini_tools = _build_tools(
             tool_registry,
