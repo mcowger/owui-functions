@@ -3205,13 +3205,17 @@ class ResponsesEngine:
     def _tool_results_to_output_items(self, results: list[ToolResult]) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         for result in results:
+            # The Responses API only accepts type/call_id/output on
+            # function_call_output items.  status and error are internal
+            # domain fields and must not be forwarded.
+            output = result.output
+            if result.status != "ok" and result.error_message:
+                output = result.error_message
             items.append(
                 {
                     "type": "function_call_output",
                     "call_id": result.call_id,
-                    "output": result.output,
-                    "status": result.status,
-                    "error": result.error_message,
+                    "output": output,
                 }
             )
         return items
