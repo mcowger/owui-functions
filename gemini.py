@@ -109,7 +109,7 @@ class PipeValves(BaseModel):
         description="If enabled, Gemini will automatically fetch URLs mentioned in prompts.",
     )
     USE_CODE_EXECUTION: bool = Field(
-        default=True,
+        default=False,
         description="If enabled, Gemini can write and execute Python in a sandboxed environment on Google's servers.",
     )
     MAX_TOOL_CALLS: int = Field(
@@ -800,9 +800,9 @@ def _build_tools(
         for definition in registry.iter_definitions()
     ]
     # Maps and Code Execution cannot be combined in the same request (API limitation).
-    # If both are enabled, drop Code Execution — Maps was explicitly opted into.
+    # If both are enabled, drop Maps — Code Execution is the more intentional opt-in.
     if google_maps and code_execution:
-        code_execution = False
+        google_maps = False
 
     has_server_tools = google_search or google_maps or url_context
     if has_server_tools:
