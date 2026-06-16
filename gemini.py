@@ -139,6 +139,7 @@ class UserValves(BaseModel):
     )
     THINKING_BUDGET: int | None = Field(default=None)
     INCLUDE_THOUGHTS: Literal["true", "false", "INHERIT"] = Field(default="INHERIT")
+    USE_GOOGLE_SEARCH: Literal["true", "false", "INHERIT"] = Field(default="INHERIT")
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "INHERIT"] = Field(
         default="INHERIT"
     )
@@ -178,6 +179,10 @@ def merge_valves(pipe_valves: PipeValves, user_valves: UserValves) -> RuntimeCon
     include_thoughts = overrides.get("INCLUDE_THOUGHTS")
     if include_thoughts not in (None, "INHERIT"):
         data["INCLUDE_THOUGHTS"] = include_thoughts == "true"
+
+    use_google_search = overrides.get("USE_GOOGLE_SEARCH")
+    if use_google_search not in (None, "INHERIT"):
+        data["USE_GOOGLE_SEARCH"] = use_google_search == "true"
 
     if overrides.get("LOG_LEVEL") not in (None, "INHERIT"):
         data["LOG_LEVEL"] = overrides["LOG_LEVEL"]
@@ -679,6 +684,9 @@ class OpenWebUIRuntimeEvents:
     async def chat_completion(self, data: dict[str, Any]) -> None:
         await self._emit({"type": "chat:completion", "data": data})
 
+    async def source(self, data: dict[str, Any]) -> None:
+        await self._emit({"type": "source", "data": data})
+
 
 def _normalize_model_id(raw_model_id: str, default_model: str) -> str:
     value = (raw_model_id or "").strip() or (default_model or "").strip()
@@ -780,36 +788,70 @@ def _build_tools(registry: OpenWebUIToolRegistry, *, google_search: bool = False
     return [types.Tool(function_declarations=declarations)]
 
 
-def _extract_grounding_citations(response: types.GenerateContentResponse, text: str) -> str:
-    """Insert inline markdown citation links from grounding metadata into text."""
+async def _emit_grounding_sources(
+    response: types.GenerateContentResponse,
+    events: "OpenWebUIRuntimeEvents",
+) -> None:
+    """Emit grounding chunks as Open WebUI source events (sidebar citations)."""
     try:
         candidate = response.candidates[0] if response.candidates else None
         if not candidate:
-            return text
+            return
         meta = candidate.grounding_metadata
         if not meta:
-            return text
+            return
         chunks = meta.grounding_chunks or []
-        supports = meta.grounding_supports or []
-        if not chunks or not supports:
-            return text
-
-        sorted_supports = sorted(supports, key=lambda s: s.segment.end_index, reverse=True)
-        for support in sorted_supports:
-            end = support.segment.end_index
-            if not support.grounding_chunk_indices:
+        seen: set[str] = set()
+        for i, chunk in enumerate(chunks):
+            web = chunk.web if chunk else None
+            if not web or not web.uri:
                 continue
-            links = []
-            for i in support.grounding_chunk_indices:
-                if i < len(chunks):
-                    web = chunks[i].web
-                    if web and web.uri:
-                        links.append(f"[{i + 1}]({web.uri})")
-            if links:
-                text = text[:end] + " " + ", ".join(links) + text[end:]
+            uri = web.uri
+            if uri in seen:
+                continue
+            seen.add(uri)
+            title = web.title or uri
+            await events.source({
+                "source": {"name": title, "url": uri},
+                "document": [title],
+                "metadata": [{"source": uri}],
+            })
     except Exception:
         pass
-    return text
+
+
+_TOOL_TYPE_DISPLAY: dict[str, str] = {
+    "GOOGLE_SEARCH_WEB": "web_search",
+    "GOOGLE_SEARCH": "web_search",
+    "GOOGLE_MAPS": "maps_search",
+    "URL_CONTEXT": "url_context",
+    "FILE_SEARCH": "file_search",
+    "CODE_EXECUTION": "code_execution",
+}
+
+
+def _format_server_tool_call_detail(part: Any) -> str:
+    """Render a server-side toolCall part as a <details> block."""
+    try:
+        tc = part.tool_call
+        if tc is not None:
+            raw_type = str(getattr(tc, "tool_type", "") or "")
+            # Strip enum prefix e.g. "ToolType.GOOGLE_SEARCH_WEB" -> "GOOGLE_SEARCH_WEB"
+            if "." in raw_type:
+                raw_type = raw_type.split(".")[-1]
+            display_name = _TOOL_TYPE_DISPLAY.get(raw_type, raw_type.lower() or "web_search")
+            args = getattr(tc, "args", {}) or {}
+            call_id = str(getattr(tc, "id", "") or "")
+            escaped_args = html.escape(json.dumps(args, ensure_ascii=False, default=str))
+            return (
+                f'<details type="tool_calls" done="true" id="{html.escape(call_id)}" '
+                f'name="{html.escape(display_name)}" arguments="{escaped_args}" result="" files="" embeds="">\n'
+                "<summary>Tool Executed</summary>\n"
+                "</details>\n"
+            )
+    except Exception:
+        pass
+    return ""
 
 
 def _build_generation_config(
@@ -1014,6 +1056,15 @@ class Pipe:
                 for block in thought_blocks:
                     await events.delta(block)
 
+                # Render server-side tool invocations (e.g. Google Search) as <details> blocks.
+                if use_search and model_content is not None:
+                    for part in (model_content.parts or []):
+                        if getattr(part, "tool_call", None) is not None:
+                            block = _format_server_tool_call_detail(part)
+                            if block:
+                                visible_blocks.append(block)
+                                await events.delta(block)
+
                 tool_calls = _tool_calls_from_response(response) if allow_tools else []
 
                 # Always append model_content to the live contents list.  When Google Search
@@ -1030,7 +1081,7 @@ class Pipe:
                         persisted_contents.append(model_content)
                     final_text = _extract_visible_text(model_content).strip() or getattr(response, "text", "") or ""
                     if use_search:
-                        final_text = _extract_grounding_citations(response, final_text)
+                        await _emit_grounding_sources(response, events)
                     if final_text:
                         await events.delta(final_text)
                         final_text_emitted = True
