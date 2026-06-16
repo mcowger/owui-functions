@@ -3633,9 +3633,21 @@ class OpenWebUIToolExecutor(ToolExecutor):
         self._parallel = parallel
 
     async def execute(self, calls: list[ToolCall]) -> list[ToolResult]:
-        if self._parallel and len(calls) > 1:
-            return list(await asyncio.gather(*(self._execute_one(call) for call in calls)))
-        return [await self._execute_one(call) for call in calls]
+        if not self._parallel or len(calls) <= 1:
+            return [await self._execute_one(call) for call in calls]
+
+        # Only truly parallelize calls to *different* tool names.
+        # Multiple calls to the same tool are serialized to prevent races on
+        # shared state (e.g. two update_task calls overwriting each other).
+        seen_names: set[str] = set()
+        has_duplicates = any(
+            (name := call.name) in seen_names or seen_names.add(name)  # type: ignore[func-returns-value]
+            for call in calls
+        )
+        if has_duplicates:
+            return [await self._execute_one(call) for call in calls]
+
+        return list(await asyncio.gather(*(self._execute_one(call) for call in calls)))
 
     async def _execute_one(self, call: ToolCall) -> ToolResult:
         fn = self._callables.get(call.name)
