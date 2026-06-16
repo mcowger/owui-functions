@@ -2931,10 +2931,15 @@ class ResponsesEngine:
 
                 tool_results = await tool_executor.execute(tool_calls)
                 state.tool_calls_executed += len(tool_results)
-                items = self._tool_results_to_output_items(tool_results)
-                for item in items:
+                # The Responses API requires each function_call item to appear
+                # in input before its matching function_call_output.  Since we
+                # are not using previous_response_id chaining we must append
+                # both the call items and the result items together.
+                call_items = self._extract_function_call_items(response)
+                result_items = self._tool_results_to_output_items(tool_results)
+                for item in result_items:
                     self._record_structured_item(item, state, cfg)
-                request.input = (request.input or []) + items
+                request.input = (request.input or []) + call_items + result_items
         except Exception as exc:
             self._logger.exception("Streaming turn failed")
             state.error_message = state.error_message or f"Internal error: {exc}"
@@ -3201,6 +3206,18 @@ class ResponsesEngine:
             if call_id and name:
                 calls.append(ToolCall(call_id=call_id, name=name, arguments_json=arguments_json))
         return calls
+
+    def _extract_function_call_items(self, response: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return the raw function_call output items from a response.
+
+        The Responses API requires that every function_call item appears in
+        ``input`` before its matching function_call_output when not using
+        previous_response_id chaining.
+        """
+        return [
+            item for item in (response.get("output") or [])
+            if isinstance(item, dict) and item.get("type") == "function_call"
+        ]
 
     def _tool_results_to_output_items(self, results: list[ToolResult]) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
