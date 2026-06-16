@@ -2941,19 +2941,12 @@ class ResponsesEngine:
                 for item in result_items:
                     self._record_structured_item(item, state, cfg)
 
-                # Chain the next request via previous_response_id so the API
-                # can match function_call_output items to the function_call
-                # items it already has stored from the prior response.
-                # Input is replaced with only the new result items — the full
-                # conversation context is carried by previous_response_id.
-                response_id = response.get("id") if isinstance(response, dict) else None
-                if response_id:
-                    request.previous_response_id = response_id
-                    request.input = result_items
-                else:
-                    # Fallback for endpoints that don't return an id: echo the
-                    # function_call items back manually before the results.
-                    request.input = (request.input or []) + call_items + result_items
+                # Always use the stateless approach: append function_call items
+                # followed by function_call_output items to the existing input.
+                # previous_response_id is not used because proxy endpoints
+                # (e.g. LiteLLM) do not persist responses server-side and
+                # return response_not_found on the next request.
+                request.input = (request.input or []) + call_items + result_items
         except Exception as exc:
             self._logger.exception("Streaming turn failed")
             state.error_message = state.error_message or f"Internal error: {exc}"
