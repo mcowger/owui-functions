@@ -2931,15 +2931,24 @@ class ResponsesEngine:
 
                 tool_results = await tool_executor.execute(tool_calls)
                 state.tool_calls_executed += len(tool_results)
-                # The Responses API requires each function_call item to appear
-                # in input before its matching function_call_output.  Since we
-                # are not using previous_response_id chaining we must append
-                # both the call items and the result items together.
-                call_items = self._extract_function_call_items(response)
                 result_items = self._tool_results_to_output_items(tool_results)
                 for item in result_items:
                     self._record_structured_item(item, state, cfg)
-                request.input = (request.input or []) + call_items + result_items
+
+                # Chain the next request via previous_response_id so the API
+                # can match function_call_output items to the function_call
+                # items it already has stored from the prior response.
+                # Input is replaced with only the new result items — the full
+                # conversation context is carried by previous_response_id.
+                response_id = response.get("id") if isinstance(response, dict) else None
+                if response_id:
+                    request.previous_response_id = response_id
+                    request.input = result_items
+                else:
+                    # Fallback for endpoints that don't return an id: echo the
+                    # function_call items back manually before the results.
+                    call_items = self._extract_function_call_items(response)
+                    request.input = (request.input or []) + call_items + result_items
         except Exception as exc:
             self._logger.exception("Streaming turn failed")
             state.error_message = state.error_message or f"Internal error: {exc}"
