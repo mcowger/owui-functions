@@ -618,11 +618,28 @@ class PipeRequestContext:
         await self.pipe.emit_event(event, self.event_emitter)
 
     async def emit_delta(self, content: str) -> None:
-        await self.emit_event({"type": "message", "data": {"content": content}})
+        # Canonical Open WebUI streaming event type (matches responses.py /
+        # gemini.py). The legacy "message" type is not rendered reliably by
+        # the OWUI frontend streaming consumer.
+        await self.emit_event(
+            {
+                "type": "chat:message:delta",
+                "data": {"role": "assistant", "content": content},
+            }
+        )
         self.final_message.append(content)
 
     async def emit_replace(self, content: str) -> None:
-        await self.emit_event({"type": "replace", "data": {"content": content}})
+        # Canonical Open WebUI replace event type. The legacy "replace" type
+        # was dropped by OWUI's streaming consumer, which caused reasoning
+        # blocks (emitted via update_content_block -> emit_replace) to vanish
+        # from the rendered message even though the model produced thinking.
+        await self.emit_event(
+            {
+                "type": "chat:message",
+                "data": {"role": "assistant", "content": content},
+            }
+        )
         self.final_message.clear()
         self.final_message.append(content)
 
@@ -640,6 +657,93 @@ class PipeRequestContext:
 
     def text(self) -> str:
         return "".join(self.final_message)
+
+
+async def _emit_debug_event_tap(
+    event: Any,
+    event_type: Any,
+    *,
+    emit_delta: Callable[[str], Awaitable[None]],
+) -> None:
+    """DEBUG tap: emit a prefixed line for every raw Anthropic stream event.
+
+    Renders whatever the API sent (thinking text, signatures, redacted thinking
+    data, text deltas, tool_use input, tool_result content, server tool events)
+    as prefixed plain-text lines in the chat output so you can see exactly what
+    is arriving. Prefixes:
+      [evt:type]            — every event's type
+      [reasoning]           — thinking_delta text
+      [signature]           — thinking signature_delta
+      [encrypted]           — redacted_thinking data
+      [text]                — text_delta
+      [tool_use:name]       — tool_use block (input JSON)
+      [tool_result]         — tool_result content
+      [server_tool:type]    — server_tool_use blocks
+    """
+    # Always emit the event type first so nothing is silently dropped.
+    await emit_delta(f"\n[evt:{event_type}]\n")
+
+    # content_block_start: dump the content_block type + any fields.
+    if event_type == "content_block_start":
+        cb = getattr(event, "content_block", None)
+        cb_type = getattr(cb, "type", None)
+        if cb_type == "thinking":
+            await emit_delta("[block:thinking-start]\n")
+        elif cb_type == "redacted_thinking":
+            data = getattr(cb, "data", "") or ""
+            await emit_delta(f"[encrypted] {data}\n")
+        elif cb_type == "text":
+            await emit_delta("[block:text-start]\n")
+        elif cb_type == "tool_use":
+            name = getattr(cb, "name", "?")
+            await emit_delta(f"[tool_use:{name}] (start)\n")
+        elif cb_type and cb_type.endswith("_tool_result"):
+            await emit_delta(f"[tool_result:{cb_type}] (start)\n")
+        elif cb_type and cb_type.startswith("server_tool_use"):
+            await emit_delta(f"[server_tool:{cb_type}] (start)\n")
+        else:
+            await emit_delta(f"[block:{cb_type}]\n")
+        return
+
+    # content_block_delta: the meat — thinking/signature/text/input_json deltas.
+    if event_type == "content_block_delta":
+        delta = getattr(event, "delta", None)
+        d_type = getattr(delta, "type", None)
+        if d_type == "thinking_delta":
+            txt = getattr(delta, "thinking", "") or ""
+            await emit_delta(f"[reasoning] {txt}\n")
+        elif d_type == "signature_delta":
+            sig = getattr(delta, "signature", "") or ""
+            await emit_delta(f"[signature] {sig}\n")
+        elif d_type == "text_delta":
+            txt = getattr(delta, "text", "") or ""
+            await emit_delta(f"[text] {txt}\n")
+        elif d_type == "input_json_delta":
+            partial = getattr(delta, "partial_json", "") or ""
+            await emit_delta(f"[tool_input] {partial}\n")
+        elif d_type == "compaction_delta":
+            await emit_delta("[compaction_delta]\n")
+        else:
+            await emit_delta(f"[delta:{d_type}]\n")
+        return
+
+    # content_block_stop
+    if event_type == "content_block_stop":
+        await emit_delta("[block-stop]\n")
+        return
+
+    # message_start / message_delta / message_stop
+    if event_type == "message_start":
+        await emit_delta("[message-start]\n")
+        return
+    if event_type == "message_delta":
+        await emit_delta("[message-delta]\n")
+        return
+    if event_type == "message_stop":
+        await emit_delta("[message-stop]\n")
+        return
+
+    # anything else: just the type line already emitted above.
 
 
 async def create_request_payload(
@@ -716,61 +820,69 @@ async def create_request_payload(
     effort_config = None
     effective_effort = None
 
-    if model_info["supports_effort"]:
+    # Single knob for thinking/effort, 7 values. `thinking` and `output_config.effort`
+    # are independent optional fields (per the Anthropic SDK's own generated
+    # all-params test, which sends both in the same request), so we combine them
+    # where both are meaningful:
+    #   none     -> thinking:{type:"disabled"}                          (off; no output_config)
+    #   adaptive -> thinking:{type:"adaptive", display:THINKING_DISPLAY} (model self-paces; no output_config)
+    #   low/medium/high/xhigh/max -> output_config:{effort: X}          (explicit effort level)
+    #                    AND thinking:{type:"adaptive", display:THINKING_DISPLAY}
+    #                    (so THINKING_DISPLAY is honored whenever thinking can occur)
+    # The `thinking` field is only sent for models that support adaptive thinking.
+    # `output_config.effort` is only sent when the model supports effort. `none`
+    # sends thinking:{disabled} only (display is irrelevant — thinking is off).
+    # Per spec: `display` is a member of ThinkingConfigAdaptive/Enabled, not Disabled.
+    _VALID_EFFORTS = ("none", "adaptive", "low", "medium", "high", "xhigh", "max")
+    _DISCRETE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
-        def _clamp_effort(value: str) -> str:
-            if value == "xhigh" and not model_info.get("supports_effort_xhigh"):
-                return "high"
-            if value == "max" and not model_info.get("supports_effort_max"):
-                return "high"
+    def _clamp_effort(value: str) -> str:
+        if value in ("none", "adaptive"):
             return value
+        if value == "xhigh" and not model_info.get("supports_effort_xhigh"):
+            return "high"
+        if value == "max" and not model_info.get("supports_effort_max"):
+            return "high"
+        return value
 
-        body_effort = body.get("reasoning_effort")
-        if body_effort in ("low", "medium", "high", "xhigh", "max"):
-            effective_effort = _clamp_effort(body_effort)
-        else:
-            effective_effort = _clamp_effort(__user__["valves"].EFFORT)
+    body_effort = body.get("reasoning_effort")
+    if isinstance(body_effort, str) and body_effort in _VALID_EFFORTS:
+        effective_effort = _clamp_effort(body_effort)
+    else:
+        effective_effort = _clamp_effort(__user__["valves"].EFFORT)
 
+    supports_adaptive = model_info.get("supports_adaptive_thinking", False)
+    supports_effort = model_info.get("supports_effort", False)
+    # thinking:{disabled} for none, thinking:{adaptive} for adaptive AND for
+    # discrete effort levels (where we also send output_config.effort so the
+    # model thinks at the requested level while honoring THINKING_DISPLAY).
+    send_disabled_thinking = effective_effort == "none" and supports_adaptive
+    send_adaptive_thinking = effective_effort != "none" and supports_adaptive
+    thinking_active = send_disabled_thinking or send_adaptive_thinking
+    logger.debug(
+        f"Thinking gate: effective_effort={effective_effort} "
+        f"thinking_active={thinking_active} "
+        f"supports_adaptive_thinking={supports_adaptive} "
+        f"supports_effort={supports_effort}"
+    )
+
+    if effective_effort in _DISCRETE_EFFORTS and supports_effort:
         effort_config = {"effort": effective_effort}
         logger.debug(f"Effort level set to: {effective_effort}")
 
-    enable_thinking = __user__["valves"].ENABLE_THINKING or __metadata__.get(
-        "anthropic_thinking", False
-    )
-    if enable_thinking and model_info["supports_thinking"]:
-
-        if model_info["supports_adaptive_thinking"]:
-            thinking_config = {"type": "adaptive"}
-        else:
-            user_budget = __user__["valves"].THINKING_BUDGET_TOKENS
-            max_tokens = min(
-                body.get("max_tokens", model_info["max_tokens"]),
-                model_info["max_tokens"],
-            )
-            context_limit = model_info.get("context_length", 200000)
-
-            if model_info.get("supports_thinking") and model_info.get(
-                "supports_programmatic_calling"
-            ):
-                thinking_budget = min(user_budget, context_limit)
-            else:
-
-                thinking_budget = (
-                    min(user_budget, max_tokens - 1) if max_tokens > 1 else 1
-                )
-            thinking_config = {
-                "type": "enabled",
-                "budget_tokens": thinking_budget,
-            }
-            logger.debug(
-                f"Using manual thinking with budget_tokens: {thinking_budget}, effort: {effective_effort}"
-            )
-
+    if send_adaptive_thinking:
+        thinking_config = {"type": "adaptive"}
         thinking_display = __user__["valves"].THINKING_DISPLAY
         if thinking_display in ("omitted", "summarized"):
             thinking_config["display"] = thinking_display
-
+        logger.debug(
+            f"Adaptive thinking enabled (effort={effective_effort}, "
+            f"display={thinking_display}, output_config={'set' if effort_config else 'none'})"
+        )
         payload["thinking"] = thinking_config
+    elif send_disabled_thinking:
+        payload["thinking"] = {"type": "disabled"}
+        logger.debug("Thinking explicitly disabled (effort=none)")
 
     user_has_memory_system_enabled = False
     try:
@@ -968,12 +1080,11 @@ async def create_request_payload(
             beta_headers.append("code-execution-2025-08-25")
         if activate_code_execution:
             beta_headers.append("files-api-2025-04-14")
-    if (
-        pipe.valves.ENABLE_INTERLEAVED_THINKING
-        and model_info["supports_thinking"]
-        and not model_info["supports_adaptive_thinking"]
-    ):
-        beta_headers.append("interleaved-thinking-2025-05-14")
+    # Note: interleaved thinking between tool calls is automatic on
+    # adaptive-thinking models (4.6+, per Anthropic adaptive-thinking docs),
+    # so no `interleaved-thinking-2025-05-14` beta header is needed. That
+    # beta was only required for the manual budget path on pre-4.6 models,
+    # which are no longer supported for extended thinking.
 
     uses_old_web_fetch = any(t.get("type") == "web_fetch_20250910" for t in tools_list)
     if pipe.valves.WEB_FETCH and uses_old_web_fetch:
@@ -1026,7 +1137,7 @@ async def create_request_payload(
 
         if (
             context_editing_strategy in ["clear_thinking", "clear_both"]
-            and enable_thinking
+            and thinking_active
             and model_info["supports_thinking"]
         ):
             _keep_val = __user__["valves"].CONTEXT_EDITING_THINKING_KEEP
@@ -2269,7 +2380,12 @@ async def handle_client_tool_input_delta(
             tool_progress_blocks[tool_id_at_start] = new_block
             final_message.clear()
             final_message.append(text)
-            await emit_event({"type": "replace", "data": {"content": text}})
+            await emit_event(
+                {
+                    "type": "chat:message",
+                    "data": {"role": "assistant", "content": text},
+                }
+            )
 
     return tools_buffer, tool_input_buffer
 
@@ -2613,29 +2729,43 @@ class Pipe:
         "claude-fable-5": {
             "supports_dynamic_filtering": True,
             "supports_compaction": True,
+            "supports_adaptive_thinking": True,
+            "supports_effort": True,
         },
         "claude-mythos-5": {
             "supports_dynamic_filtering": True,
             "supports_compaction": True,
+            "supports_adaptive_thinking": True,
+            "supports_effort": True,
         },
         "claude-opus-4-8": {
             "supports_dynamic_filtering": True,
             "supports_fast_mode": True,
             "supports_compaction": True,
+            "supports_adaptive_thinking": True,
+            "supports_effort": True,
         },
         "claude-opus-4-7": {
             "supports_dynamic_filtering": True,
             "supports_fast_mode": True,
             "supports_compaction": True,
+            "supports_adaptive_thinking": True,
+            "supports_effort": True,
+            "supports_effort_xhigh": True,
         },
         "claude-opus-4-6": {
             "supports_dynamic_filtering": True,
             "supports_fast_mode": True,
             "supports_compaction": True,
+            "supports_adaptive_thinking": True,
+            "supports_effort": True,
+            "supports_effort_max": True,
         },
         "claude-sonnet-4-6": {
             "supports_dynamic_filtering": True,
             "supports_compaction": True,
+            "supports_adaptive_thinking": True,
+            "supports_effort": True,
         },
     }
 
@@ -2649,7 +2779,6 @@ class Pipe:
     _DEFAULT_MAX_TOKENS = 64000
 
     REQUEST_TIMEOUT = 300
-    THINKING_BUDGET_TOKENS = 4096
     TOOL_CALL_TIMEOUT = 120
 
     class Valves(BaseModel):
@@ -2661,10 +2790,6 @@ class Pipe:
         ENABLE_FAST_MODE: bool = Field(
             default=False,
             description="Enable Fast Mode for Opus Models. Up to 2.5x faster output at higher costs",
-        )
-        ENABLE_INTERLEAVED_THINKING: bool = Field(
-            default=True,
-            description="Claude can generate thinking blocks between tool calls instead of only at the end.",
         )
         WEB_SEARCH: bool = Field(
             default=True,
@@ -2765,23 +2890,29 @@ class Pipe:
             default="",
             description="Overrides the admin-configured API key.",
         )
-        ENABLE_THINKING: bool = Field(
+        DEBUG_STREAM: bool = Field(
             default=False,
-            description="Enable Extended Thinking",
-        )
-        THINKING_BUDGET_TOKENS: int = Field(
-            default=8192,
-            ge=1024,
-            le=64000,
-            description="Thinking budget tokens",
+            description="DEBUG: emit every raw stream event (thinking, signatures, text, tool_use, tool_result, redacted_thinking, etc.) as prefixed lines in the chat output. For diagnosis only — produces noisy output. Prefixes: [evt:type], [reasoning], [signature], [text], [encrypted], [tool_use], [tool_result], etc.",
         )
         THINKING_DISPLAY: Literal["summarized", "omitted"] = Field(
-            default="omitted",
-            description="'summarized' returns summarized thinking, 'omitted' hides thinking in favor of faster time-to-first-text.",
+            default="summarized",
+            description="'summarized' returns thinking content normally (visible in the reasoning panel). 'omitted' redacts thinking content in favor of faster time-to-first-text (shows an empty reasoning block). Defaults to 'summarized' so thinking is visible whenever it occurs.",
         )
-        EFFORT: Literal["low", "medium", "high", "xhigh", "max"] = Field(
-            default="high",
-            description="How much effort should be applied to answer the next requestEffort level for this user. Also controllable via OpenWebUI's reasoning_effort parameter.",
+        EFFORT: Literal["none", "adaptive", "low", "medium", "high", "xhigh", "max"] = (
+            Field(
+                default="low",
+                description=(
+                    "Single knob for thinking/effort (7 values). 'none' disables thinking "
+                    "(sends thinking:{type:disabled}). 'adaptive' lets the model self-pace "
+                    "(sends thinking:{type:adaptive, display:THINKING_DISPLAY}). "
+                    "low/medium/high/xhigh/max set an explicit effort level "
+                    "(sends output_config.effort, NO thinking field). Exactly one of "
+                    "thinking/output_config.effort is ever sent. Only models that support "
+                    "adaptive thinking emit the thinking field; on others only effort "
+                    "(if supported) is sent. Also controllable per-request via OpenWebUI's "
+                    "reasoning_effort parameter."
+                ),
+            )
         )
         USE_PDF_NATIVE_UPLOAD: bool = Field(
             default=True,
@@ -6289,6 +6420,11 @@ class Pipe:
                     logger.debug(f"UserValves: {user_valves}")
 
             user_valves = __user__.get("valves")
+            debug_stream = (
+                bool(getattr(user_valves, "DEBUG_STREAM", False))
+                if user_valves
+                else False
+            )
             user_api_key = (
                 getattr(user_valves, "ANTHROPIC_API_KEY", "") if user_valves else ""
             )
@@ -6608,6 +6744,23 @@ class Pipe:
                             logger.debug(
                                 f"Received stream event: {event_type} | counts: {stream_event_counts} | payload: {event}"
                             )
+
+                            # DEBUG TAP: emit a prefixed line for every raw
+                            # stream event so the chat output shows exactly what
+                            # the API is sending (thinking, signatures, text,
+                            # tool_use, tool_result, redacted_thinking, etc.).
+                            # Gated on the DEBUG_STREAM UserValve.
+                            if debug_stream:
+                                try:
+                                    await _emit_debug_event_tap(
+                                        event,
+                                        event_type,
+                                        emit_delta=emit_message_delta,
+                                    )
+                                except Exception as _dbg_err:
+                                    await emit_message_delta(
+                                        f"\n[debug-tap-error: {_dbg_err}]\n"
+                                    )
                             if event_type == "message_start":
 
                                 stream_output_tokens = self._handle_message_start_usage(
@@ -7315,9 +7468,10 @@ class Pipe:
                                                         final_message.append(text)
                                                         await request_ctx.emit_event(
                                                             {
-                                                                "type": "replace",
+                                                                "type": "chat:message",
                                                                 "data": {
-                                                                    "content": text
+                                                                    "role": "assistant",
+                                                                    "content": text,
                                                                 },
                                                             }
                                                         )
@@ -7377,8 +7531,11 @@ class Pipe:
                                                     final_message.append(text)
                                                     await request_ctx.emit_event(
                                                         {
-                                                            "type": "replace",
-                                                            "data": {"content": text},
+                                                            "type": "chat:message",
+                                                            "data": {
+                                                                "role": "assistant",
+                                                                "content": text,
+                                                            },
                                                         }
                                                     )
 
@@ -7860,7 +8017,13 @@ class Pipe:
                 consolidated = final_text()
                 if consolidated:
                     await emit_event_local(
-                        {"type": "replace", "data": {"content": consolidated}}
+                        {
+                            "type": "chat:message",
+                            "data": {
+                                "role": "assistant",
+                                "content": consolidated,
+                            },
+                        }
                     )
                 await emit_event_local(
                     {
@@ -8025,7 +8188,10 @@ class Pipe:
         consolidated = final_text()
         if consolidated:
             await emit_event_local(
-                {"type": "replace", "data": {"content": consolidated}}
+                {
+                    "type": "chat:message",
+                    "data": {"role": "assistant", "content": consolidated},
+                }
             )
 
         await status.complete(final_status)
@@ -8082,4 +8248,3 @@ class Pipe:
     _SKIP_BLOCK_TYPES = frozenset({"context_cleared"})
 
     METADATA_PATTERN = re.compile(r"\[\]\(anthropic:([^)]+)\)")
-
