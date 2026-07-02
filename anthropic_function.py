@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.9.17
+version: 0.9.18
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.103.0
 environment_variables:
@@ -37,6 +37,17 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.18
+- Removed "API tool passthrough" (api_tool_names/api_tool_passthrough): any
+  tool the model calls is now always dispatched for real execution via
+  __tools__/builtin_tools callables. Previously, tools present in body.tools
+  but not (yet) resolved to a local callable — e.g. Open Terminal tools like
+  glob_search/list_files — were misclassified as "passthrough" and had their
+  raw JSON input dumped into the visible chat text instead of being executed,
+  permanently stuck their progress widget at done="false", and desynced
+  completion of sibling tool calls in the same turn. Tool execution and
+  validation belongs to Open WebUI; the pipe no longer second-guesses it.
+
 v0.9.17
 - Added Fable and Mythos as advisor models
 - Advisor Models is now dynamically adjusted to the next best model if not compatible
@@ -754,7 +765,7 @@ async def create_request_payload(
     __tools__: Optional[Dict[str, Dict[str, Any]]],
     __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
     __files__: Optional[List[Dict[str, Any]]] = None,
-) -> tuple[dict, dict, List[str], List[str]]:
+) -> tuple[dict, dict, List[str]]:
 
     status_cls = globals().get("StatusEmitter")
     if status_cls:
@@ -1011,9 +1022,44 @@ async def create_request_payload(
                 processed_messages, native_pdf_filenames
             )
 
-    tools_list, api_tool_names = pipe._convert_tools_to_claude_format(
+    logger.info(
+        "[TOOLS-DEBUG] pre-convert: __tools__ keys=%s | body.tools names=%s | "
+        "body.tool_choice=%r",
+        sorted((__tools__ or {}).keys()),
+        [
+            (t.get("function") or {}).get("name")
+            for t in (body.get("tools") or [])
+            if isinstance(t, dict)
+        ],
+        body.get("tool_choice"),
+    )
+    if __tools__:
+        for _tn, _td in __tools__.items():
+            logger.info(
+                "[TOOLS-DEBUG] __tools__['%s']: type=%s has_callable=%s has_spec=%s spec_name=%r",
+                _tn,
+                type(_td).__name__,
+                bool(isinstance(_td, dict) and _td.get("callable")),
+                bool(isinstance(_td, dict) and "spec" in _td),
+                (_td.get("spec") or {}).get("name") if isinstance(_td, dict) else None,
+            )
+
+    tools_list = pipe._convert_tools_to_claude_format(
         __tools__, body, actual_model_name, __user__, __metadata__
     )
+
+    logger.info(
+        "[TOOLS-DEBUG] post-convert: tools_list sent to Anthropic (%d tools) = %s",
+        len(tools_list),
+        [t.get("name") for t in tools_list],
+    )
+    try:
+        logger.debug(
+            "[TOOLS-DEBUG] post-convert full tools_list dump: %s",
+            json.dumps(tools_list, ensure_ascii=False, default=str),
+        )
+    except Exception as _dbg_e:
+        logger.debug("[TOOLS-DEBUG] failed to json.dumps tools_list: %s", _dbg_e)
 
     activate_code_execution = __metadata__.get("activate_code_execution_tool", False)
 
@@ -1334,7 +1380,7 @@ async def create_request_payload(
 
     payload["messages"] = processed_messages
 
-    return payload, headers, new_marker_metadata, api_tool_names
+    return payload, headers, new_marker_metadata
 
 
 def _serialize_content_payload(content: Any) -> Any:
@@ -2400,12 +2446,11 @@ async def handle_tool_use_block_stop(
     tools_buffer: str,
     tools: dict[str, Any] | None,
     builtin_tools: dict[str, Any],
-    api_tool_names: list[str],
     running_tool_tasks: list[Any],
     emit_delta: Callable[[str], Awaitable[None]],
-) -> tuple[str, bool]:
+) -> str:
     if not tools_buffer:
-        return tools_buffer, False
+        return tools_buffer
 
     try:
         json.loads(tools_buffer)
@@ -2420,7 +2465,6 @@ async def handle_tool_use_block_stop(
         logger.debug(" Closed tools_buffer in content_block_stop: %s", tools_buffer)
 
     logger.debug("Parsed tool call: %s", tools_buffer)
-    api_tool_passthrough = False
 
     try:
         tool_call_data = json.loads(tools_buffer)
@@ -2491,13 +2535,6 @@ async def handle_tool_use_block_stop(
                 tool_name,
                 len(running_tool_tasks),
             )
-        elif tool_name in api_tool_names:
-            logger.info(
-                "🔄 API tool passthrough for '%s': returning tool input as response",
-                tool_name,
-            )
-            await emit_delta(json.dumps(tool_input, ensure_ascii=False))
-            api_tool_passthrough = True
         else:
             logger.warning(
                 "Tool '%s' not found in __tools__ or builtin_tools", tool_name
@@ -2518,7 +2555,7 @@ async def handle_tool_use_block_stop(
     except Exception as e:
         logger.error("Failed to start tool execution: %s", e)
 
-    return "", api_tool_passthrough
+    return ""
 
 
 def handle_text_block_start(content_block: Any, chunk: str) -> str:
@@ -3851,10 +3888,9 @@ class Pipe:
         actual_model_name: str,
         __user__: Dict[str, Any],
         __metadata__: dict[str, Any],
-    ) -> tuple[List[dict], set]:
+    ) -> List[dict]:
         claude_tools = []
         tool_names_seen = set()
-        api_tool_names = set()
         forced_tool_name = None
         requested_tool_choice = body.get("tool_choice")
         if isinstance(requested_tool_choice, dict):
@@ -3886,6 +3922,20 @@ class Pipe:
         text_editor_active = (
             self.valves.ENABLE_TEXT_EDITOR_TOOL and has_write_file and has_replace_file
         )
+        logger.info(
+            "[TOOLS-DEBUG] convert-entry: __tools__ present=%s keys=%s | "
+            "ENABLE_BASH_TOOL=%s has_run_command=%s bash_active=%s | "
+            "ENABLE_TEXT_EDITOR_TOOL=%s has_write_file=%s has_replace_file=%s text_editor_active=%s",
+            bool(__tools__),
+            sorted((__tools__ or {}).keys()),
+            self.valves.ENABLE_BASH_TOOL,
+            has_run_command,
+            bash_active,
+            self.valves.ENABLE_TEXT_EDITOR_TOOL,
+            has_write_file,
+            has_replace_file,
+            text_editor_active,
+        )
         terminal_hidden_names: set[str] = set()
         if bash_active:
             terminal_hidden_names.add("run_command")
@@ -3898,6 +3948,18 @@ class Pipe:
             )
 
         body_tools = body.get("tools", [])
+        logger.info(
+            "[TOOLS-DEBUG] body_tools: count=%d entries=%s",
+            len(body_tools),
+            [
+                {
+                    "type": t.get("type"),
+                    "name": (t.get("function") or {}).get("name"),
+                }
+                for t in body_tools
+                if isinstance(t, dict)
+            ],
+        )
         if body_tools:
             logger.debug(f"Found {len(body_tools)} built-in tools in body.tools")
             for tool_entry in body_tools:
@@ -3905,6 +3967,13 @@ class Pipe:
                     func = tool_entry.get("function", {})
                     name = func.get("name")
                     if not name or name in tool_names_seen:
+                        logger.info(
+                            "[TOOLS-DEBUG] body_tools: skipping entry name=%r "
+                            "(no_name=%s already_seen=%s)",
+                            name,
+                            not name,
+                            name in tool_names_seen if name else None,
+                        )
                         continue
 
                     if name in anthropic_server_tool_names:
@@ -3928,13 +3997,14 @@ class Pipe:
                     }
                     claude_tools.append(claude_tool)
                     tool_names_seen.add(name)
-
-                    if not (
-                        __tools__
-                        and name in __tools__
-                        and __tools__[name].get("callable")
-                    ):
-                        api_tool_names.add(name)
+                    logger.info(
+                        "[TOOLS-DEBUG] body_tools: ADDED claude_tool name=%r", name
+                    )
+                else:
+                    logger.info(
+                        "[TOOLS-DEBUG] body_tools: skipping non-function entry type=%r",
+                        tool_entry.get("type"),
+                    )
 
         if __tools__ and logger.isEnabledFor(logging.DEBUG):
 
@@ -4085,10 +4155,23 @@ class Pipe:
                 f"max_characters={self.valves.TEXT_EDITOR_MAX_CHARACTERS})"
             )
 
+        logger.info(
+            "[TOOLS-DEBUG] __tools__ loop: entering with __tools__ present=%s count=%d keys=%s",
+            bool(__tools__),
+            len(__tools__ or {}),
+            sorted((__tools__ or {}).keys()),
+        )
         if __tools__ and len(__tools__) > 0:
             for tool_name, tool_data in __tools__.items():
                 if not isinstance(tool_data, dict) or "spec" not in tool_data:
-                    logger.debug(f"Skipping invalid tool: {tool_name} - missing spec")
+                    logger.info(
+                        "[TOOLS-DEBUG] __tools__ loop: SKIP %r - missing/invalid spec "
+                        "(is_dict=%s has_spec_key=%s tool_data=%r)",
+                        tool_name,
+                        isinstance(tool_data, dict),
+                        isinstance(tool_data, dict) and "spec" in tool_data,
+                        tool_data,
+                    )
                     continue
 
                 spec = tool_data["spec"]
@@ -4096,6 +4179,12 @@ class Pipe:
                 name = spec.get("name", tool_name)
 
                 if name in tool_names_seen:
+                    logger.info(
+                        "[TOOLS-DEBUG] __tools__ loop: SKIP %r - name already in "
+                        "tool_names_seen=%s",
+                        name,
+                        sorted(tool_names_seen),
+                    )
                     continue
 
                 if name.startswith("_"):
@@ -4103,7 +4192,12 @@ class Pipe:
                     continue
 
                 if name in terminal_hidden_names:
-                    logger.debug(f"Skipping bridged Open Terminal tool: {name}")
+                    logger.info(
+                        "[TOOLS-DEBUG] __tools__ loop: SKIP %r - in terminal_hidden_names=%s "
+                        "(bridged to native Claude bash/text_editor tool instead)",
+                        name,
+                        sorted(terminal_hidden_names),
+                    )
                     continue
 
                 description = spec.get("description", f"Tool: {name}")
@@ -4125,6 +4219,17 @@ class Pipe:
 
                 claude_tools.append(claude_tool)
                 tool_names_seen.add(name)
+                logger.info(
+                    "[TOOLS-DEBUG] __tools__ loop: ADDED claude_tool name=%r "
+                    "has_callable=%s",
+                    name,
+                    bool(tool_data.get("callable")),
+                )
+        else:
+            logger.info(
+                "[TOOLS-DEBUG] __tools__ loop: SKIPPED ENTIRELY - __tools__ is empty/falsy "
+                "(this is the #1 suspect if terminal tools are missing from the outgoing request)"
+            )
 
         is_programmatic_active = False
         if self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING:
@@ -4209,7 +4314,7 @@ class Pipe:
                 flags.append("eager_stream")
             logger.info(f"  🔧 Tool: {t.get('name')} [{', '.join(flags) or 'normal'}]")
 
-        return claude_tools, api_tool_names
+        return claude_tools
 
     def _parse_assistant_tool_calls_string(self, content: str) -> list[dict]:
         segments: list[tuple[str, str]] = []
@@ -6434,6 +6539,22 @@ class Pipe:
 
         try:
 
+            logger.info(
+                "[TOOLS-DEBUG] pipe() called: body.tools count=%d names=%s | "
+                "__tools__ arg type=%s | __metadata__.tools present=%s keys=%s | "
+                "__metadata__.terminal_id=%r",
+                len(body.get("tools") or []),
+                [
+                    (t.get("function") or {}).get("name")
+                    for t in (body.get("tools") or [])
+                    if isinstance(t, dict)
+                ],
+                type(__tools__).__name__,
+                bool((__metadata__ or {}).get("tools")),
+                sorted(((__metadata__ or {}).get("tools") or {}).keys()),
+                (__metadata__ or {}).get("terminal_id"),
+            )
+
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Valves: {self.valves.model_dump()}")
                 user_valves = __user__.get("valves")
@@ -6465,8 +6586,19 @@ class Pipe:
             if __task__:
                 return await self._run_task_model_request(body)
 
+            logger.info(
+                "[TOOLS-DEBUG] pipe() entry: __tools__ raw type=%s is_awaitable=%s",
+                type(__tools__).__name__,
+                inspect.isawaitable(__tools__),
+            )
             if inspect.isawaitable(__tools__):
                 __tools__ = await __tools__
+
+            logger.info(
+                "[TOOLS-DEBUG] pipe() entry (resolved): __tools__ type=%s keys=%s",
+                type(__tools__).__name__,
+                sorted((__tools__ or {}).keys()) if isinstance(__tools__, dict) else __tools__,
+            )
 
             builtin_tools = {}
             if BUILTIN_TOOLS_AVAILABLE and __request__:
@@ -6608,7 +6740,7 @@ class Pipe:
             if __metadata__ is not None:
                 __metadata__.setdefault("params", {})["reasoning_tags"] = False
 
-            payload, headers, new_marker_metadata, api_tool_names = (
+            payload, headers, new_marker_metadata = (
                 await self._create_payload(
                     body,
                     __metadata__,
@@ -6676,7 +6808,6 @@ class Pipe:
             tool_input_buffer = ""
             tool_calls = []
             running_tool_tasks = []
-            api_tool_passthrough = False
             tool_progress_blocks = {}
 
             active_server_tool_name = None
@@ -7244,20 +7375,13 @@ class Pipe:
                                         "code_execution_code"
                                     ]
                                 elif content_type == "tool_use" and tools_buffer:
-                                    tools_buffer, started_api_tool_passthrough = (
-                                        await handle_tool_use_block_stop(
-                                            pipe=self,
-                                            tools_buffer=tools_buffer,
-                                            tools=__tools__,
-                                            builtin_tools=builtin_tools,
-                                            api_tool_names=api_tool_names,
-                                            running_tool_tasks=running_tool_tasks,
-                                            emit_delta=emit_message_delta,
-                                        )
-                                    )
-                                    api_tool_passthrough = (
-                                        api_tool_passthrough
-                                        or started_api_tool_passthrough
+                                    tools_buffer = await handle_tool_use_block_stop(
+                                        pipe=self,
+                                        tools_buffer=tools_buffer,
+                                        tools=__tools__,
+                                        builtin_tools=builtin_tools,
+                                        running_tool_tasks=running_tool_tasks,
+                                        emit_delta=emit_message_delta,
                                     )
                                 elif is_model_thinking and content_type in (
                                     "thinking",
@@ -7349,13 +7473,6 @@ class Pipe:
                                         await emit_message_delta(chunk)
                                         chunk = ""
                                         chunk_count = 0
-
-                                    if api_tool_passthrough and not running_tool_tasks:
-                                        logger.info(
-                                            "🔄 API tool passthrough complete — skipping tool loop"
-                                        )
-                                        conversation_ended = True
-                                        break
 
                                     if running_tool_tasks:
                                         logger.debug(
@@ -7570,7 +7687,6 @@ class Pipe:
 
                                     running_tool_tasks = []
                                     tool_progress_blocks = {}
-                                    api_tool_passthrough = False
                                     has_pending_tool_calls = True
                                 elif stop_reason == "max_tokens":
                                     chunk += (

@@ -106,7 +106,7 @@ def _build_payload(
     }
     user = {"valves": user_valves}
 
-    payload, headers, _markers, _tool_names = asyncio.run(
+    payload, headers, _markers = asyncio.run(
         create_request_payload(
             pipe,
             body,
@@ -243,7 +243,7 @@ def test_body_reasoning_effort_overrides_valve():
         "stream": True,
         "reasoning_effort": "high",  # override
     }
-    payload, _headers, _markers, _tool_names = asyncio.run(
+    payload, _headers, _markers = asyncio.run(
         create_request_payload(
             pipe, body, {}, {"valves": user_valves}, None, _noop_emitter, None
         )

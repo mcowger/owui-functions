@@ -1,0 +1,969 @@
+{
+  "max_tokens": 64000,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<attached_files>\n<file type=\"file\" url=\"a98a1b9e-bfb9-4257-92a4-1e54558fd4bd\" content_type=\"image/png\" name=\"Screenshot 2026-07-01 at 8.03.30 PM.png\"/>\n</attached_files>\n\n"
+        },
+        {
+          "type": "text",
+          "text": "Review the code for open-webui in your folder.  If a skill is disabled in the UI as shown, does that mean its not visble to the model at all?"
+        },
+        {
+          "type": "image",
+          "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "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
+          },
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    }
+  ],
+  "model": "claude-sonnet-5",
+  "metadata": {},
+  "system": [
+    {
+      "type": "text",
+      "text": "Never Ever use an em dash ( — ).\n\nNever end with teasers or offers for more.  When making factual statements, you must be able to provide a citation.   When asked questions about code, use your github or terminal/command tools to research the code.\n\nShort answers are preferred to long ones.  You are a tool, not a friend. Bias towards using your search tools vs not using them.\n<memory_context>\n[Relevant Context]\n- User evaluated embedding models for code indexing with speed as a priority.\n\nKey findings:\n- Overall best balance: Qwen3 Embedding 4B ($0.01-0.02/1M, 33K context, code retrieval support, fast)\n- Best pure code quality (all models): Mistral Codestral Embed 2505 — purpose-built for code, but 8K context limit and $0.15/1M\n- Fastest/cheapest general option: all-MiniLM-L6-v2 — no code-specific training though\n\nOpenAI vs Google shortlist (user narrowed to these two providers):\n- Best for speed (OpenAI): text-embedding-3-small — fast, cheap at $0.02/1M, 8K context, better than ada-002\n- Best for quality: Gemini Embedding 001 — top MTEB scores, explicitly covers coding, 20K context, but slowest and most expensive at $0.15/1M\n- text-embedding-ada-002: considered legacy/outdated, avoid\n- text-embedding-3-large: better quality than 3-small but slower and $0.13/1M\n\nUser priorities: speed is heavily weighted, code retrieval quality matters, cost and context window are secondary factors. User prefers OpenAI and Google providers over others.\n- User is looking for simple local memory systems for AI agents. Preferences: portable storage in Markdown or SQLite, reasonable tool count (ideally under 25), no account required with the vendor, embeddings are acceptable, and they prefer projects with at least about 200 GitHub stars. User considers agentmemory, Serena, and Mem0 too large, complex, or account-gated. Candidate projects discussed in this chat included Noema, sqlite-memory, memory-graph, remindb, ai-agent-memory, smriti, signetai, remnic, basic-memory, consolidation-memory, sediment, agentkits-memory, knowledge-base-server, hermes-local-memory, and mcp-memory-service.\n- Plexus base URL: https://plexus.home.cowger.us | Admin password/key: Habloo12\n- Don't suggest alternatives that are completely different from what's being discussed. If the user is asking about X and X doesn't work, don't pivot to Y as if it's a substitute. Stay on topic, acknowledge the gap,\n</memory_context>\nYou have access to a computer running Linux 6.18.33-Unraid (x86_64) on host \"1df6d856a96b\" as user 'unknown' with /bin/bash. Python 3.12.13 is available.\n\nUse your tools to directly interact with the system — run commands, read and write files, and search the filesystem. Prefer verifying the current state before making changes. When running commands, check the output to confirm success. If a command produces no output, that typically means it succeeded.",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "tools": [
+    {
+      "name": "list_files",
+      "description": "Return a structured listing of files and directories at the given path.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "directory": {
+            "type": "string",
+            "description": "Directory path to list."
+          }
+        },
+        "required": []
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "read_file",
+      "description": "Read a file and return its contents. Supports text files and images (PNG, JPEG, WebP, etc.). For text files you can optionally request a specific line range. Images are returned as binary so you can view and analyze them directly. Use display_file to show a file to the user.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file to read."
+          },
+          "start_line": {
+            "description": "First line to return (1-indexed, inclusive). Defaults to the beginning of the file."
+          },
+          "end_line": {
+            "description": "Last line to return (1-indexed, inclusive). Defaults to the end of the file."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "display_file",
+      "description": "Open a file in the user's file viewer so they can see it. Use this when the user wants to view or look at a file. This does not return file content to you — use read_file if you need to read the content yourself.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute path to the file to display."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "write_file",
+      "description": "Write text content to a file. Creates parent directories automatically. Overwrites if the file already exists.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path to write to. Parent directories are created automatically."
+          },
+          "content": {
+            "type": "string",
+            "description": "Text content to write to the file."
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ]
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "replace_file_content",
+      "description": "Find and replace exact strings in a file. Supports multiple replacements in one call with optional line range narrowing.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file to modify."
+          },
+          "replacements": {
+            "type": "array",
+            "description": "List of find-and-replace operations to apply sequentially.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "target": {
+                  "type": "string",
+                  "description": "Exact string to find. Must match precisely, including whitespace."
+                },
+                "replacement": {
+                  "type": "string",
+                  "description": "Content to replace the target with."
+                },
+                "start_line": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Narrow the search to lines at or after this (1-indexed)."
+                },
+                "end_line": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Narrow the search to lines at or before this (1-indexed)."
+                },
+                "allow_multiple": {
+                  "type": "boolean",
+                  "description": "If true, replaces all occurrences. If false, errors when multiple matches are found."
+                }
+              },
+              "required": [
+                "target",
+                "replacement"
+              ]
+            }
+          }
+        },
+        "required": [
+          "path",
+          "replacements"
+        ]
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "grep_search",
+      "description": "Search for a text pattern across files in a directory. Returns structured matches with file paths, line numbers, and matching lines. Skips binary files.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Text or regex pattern to search for."
+          },
+          "path": {
+            "type": "string",
+            "description": "Directory or file to search in."
+          },
+          "regex": {
+            "type": "boolean",
+            "description": "Use regex. Set false for literal search."
+          },
+          "case_insensitive": {
+            "type": "boolean",
+            "description": "Perform case-insensitive matching."
+          },
+          "include": {
+            "description": "Glob patterns to filter files (e.g. '*.py'). Files must match at least one pattern."
+          },
+          "match_per_line": {
+            "type": "boolean",
+            "description": "If true, return each matching line with line numbers. If false, return only the names of matching files."
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum number of matches to return."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "glob_search",
+      "description": "Search for files and subdirectories by name within a specified directory using glob patterns. Results will include the relative path, type, size, and modification time.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Glob pattern to search for (e.g. '*.py')."
+          },
+          "path": {
+            "type": "string",
+            "description": "Directory to search within."
+          },
+          "exclude": {
+            "description": "Glob patterns to exclude from search results."
+          },
+          "type": {
+            "description": "Type filter: 'file', 'directory', or 'any'."
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum number of matches to return."
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "list_processes",
+      "description": "Returns a list of all tracked background processes, including running, done, and killed.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "run_command",
+      "description": "Run a shell command in the background and return a command ID.\n\nThis system is running Linux 6.18.33-Unraid (x86_64) on 1df6d856a96b as user 'unknown' with /bin/bash. Python 3.12.13 is available.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "wait": {
+            "description": "Seconds to wait for the command to finish before returning. If the command completes in time, output is included inline. Null to return immediately."
+          },
+          "tail": {
+            "description": "Return only the last N output entries. Useful to limit response size when only recent output matters."
+          },
+          "command": {
+            "type": "string",
+            "description": "Shell command to execute. Supports chaining (&&, ||, ;), pipes (|), and redirections."
+          },
+          "cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Working directory for the command. Defaults to the server's current directory if not set."
+          },
+          "env": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {},
+                "required": []
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Extra environment variables merged into the subprocess environment."
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "get_process_status",
+      "description": "Returns new output since the last poll, process status, and exit code. Output is drained on read to keep memory bounded.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "process_id": {
+            "type": "string",
+            "description": ""
+          },
+          "wait": {
+            "description": "Seconds to wait for the process to finish before returning. Returns early if the process exits. Null to return immediately."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Number of output entries to skip. Use next_offset from the previous response to get only new output."
+          },
+          "tail": {
+            "description": "Return only the last N output entries. Useful to limit response size when only recent output matters."
+          }
+        },
+        "required": [
+          "process_id"
+        ]
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "send_process_input",
+      "description": "Write text to the process's stdin. Include newline characters as needed.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "process_id": {
+            "type": "string",
+            "description": ""
+          },
+          "input": {
+            "type": "string",
+            "description": "Text to send to the process's stdin. Include newline characters as needed."
+          }
+        },
+        "required": [
+          "process_id",
+          "input"
+        ]
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "kill_process",
+      "description": "Terminate the process. Sends SIGTERM by default for graceful shutdown. Use force=true to send SIGKILL.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "process_id": {
+            "type": "string",
+            "description": ""
+          },
+          "force": {
+            "type": "boolean",
+            "description": "Send SIGKILL instead of SIGTERM."
+          }
+        },
+        "required": [
+          "process_id"
+        ]
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "get_current_timestamp",
+      "description": "Get the current Unix timestamp in seconds.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "calculate_timestamp",
+      "description": "Get the current Unix timestamp, optionally adjusted by days, weeks, months, or years.\nUse this to calculate timestamps for date filtering in search functions.\nExamples: \"last week\" = weeks_ago=1, \"3 days ago\" = days_ago=3, \"a year ago\" = years_ago=1",
+      "input_schema": {
+        "properties": {
+          "days_ago": {
+            "default": 0,
+            "description": "Number of days to subtract from current time (default: 0)",
+            "type": "integer"
+          },
+          "weeks_ago": {
+            "default": 0,
+            "description": "Number of weeks to subtract from current time (default: 0)",
+            "type": "integer"
+          },
+          "months_ago": {
+            "default": 0,
+            "description": "Number of months to subtract from current time (default: 0)",
+            "type": "integer"
+          },
+          "years_ago": {
+            "default": 0,
+            "description": "Number of years to subtract from current time (default: 0)",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "list_knowledge_bases",
+      "description": "List the user's accessible knowledge bases so a relevant internal source\ncan be chosen.",
+      "input_schema": {
+        "properties": {
+          "count": {
+            "default": 10,
+            "description": "Maximum number of KBs to return (default: 10)",
+            "type": "integer"
+          },
+          "skip": {
+            "default": 0,
+            "description": "Number of results to skip for pagination (default: 0)",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "search_knowledge_bases",
+      "description": "Search the user's accessible knowledge bases by name and description to find\na relevant internal source.",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "description": "The search query to find matching knowledge bases",
+            "type": "string"
+          },
+          "count": {
+            "default": 5,
+            "description": "Maximum number of results to return (default: 5)",
+            "type": "integer"
+          },
+          "skip": {
+            "default": 0,
+            "description": "Number of results to skip for pagination (default: 0)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "query_knowledge_bases",
+      "description": "Search knowledge bases by semantic similarity to query.\nFinds KBs whose name/description match the meaning of your query.\nHelpful for discovering which knowledge base to query next.",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "description": "Natural language query describing what you're looking for",
+            "type": "string"
+          },
+          "count": {
+            "default": 5,
+            "description": "Maximum results (default: 5)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "grep_knowledge_files",
+      "description": "Search for exact text across knowledge files. Returns matching lines with line numbers.\nUnlike query_knowledge_files (semantic/vector search), this performs exact string matching.\nAutomatically detects regex patterns (e.g. \"error|warn\", \"version \\d+\").\nHelpful for literal strings, identifiers, error messages, or regex-style searches.",
+      "input_schema": {
+        "properties": {
+          "pattern": {
+            "description": "The text pattern to search for (regex auto-detected)",
+            "type": "string"
+          },
+          "file_id": {
+            "description": "Optional file ID to search within a single file only",
+            "type": "string"
+          },
+          "case_insensitive": {
+            "default": false,
+            "description": "If true, ignore case when matching (default: false)",
+            "type": "boolean"
+          },
+          "count_only": {
+            "default": false,
+            "description": "If true, return only match counts per file (default: false)",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "search_knowledge_files",
+      "description": "Search files by filename across knowledge bases the user has access to.\nWhen the model has attached knowledge, searches only within attached KBs and files.\nHelpful when looking for a specific document or file name.",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "description": "The search query to find matching files by filename",
+            "type": "string"
+          },
+          "knowledge_id": {
+            "description": "Optional KB id to limit search to a specific knowledge base",
+            "type": "string"
+          },
+          "count": {
+            "default": 5,
+            "description": "Maximum number of results to return (default: 5)",
+            "type": "integer"
+          },
+          "skip": {
+            "default": 0,
+            "description": "Number of results to skip for pagination (default: 0)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "query_knowledge_files",
+      "description": "Search knowledge base files using semantic/vector search. Searches across collections (KBs),\nindividual files, and notes that the user has access to.\nHelpful for internal documentation, uploaded knowledge, and attached model knowledge.",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "description": "The search query to find semantically relevant content",
+            "type": "string"
+          },
+          "knowledge_ids": {
+            "description": "Optional list of KB ids to limit search to specific knowledge bases",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "count": {
+            "default": 5,
+            "description": "Maximum number of results to return (default: 5)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "view_knowledge_file",
+      "description": "Get the content of a file from a knowledge base. Supports pagination for large files.",
+      "input_schema": {
+        "properties": {
+          "file_id": {
+            "description": "The ID of the file to retrieve",
+            "type": "string"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Character offset to start reading from (default: 0)",
+            "type": "integer"
+          },
+          "max_chars": {
+            "default": 10000,
+            "description": "Maximum characters to return (default: 10000, hard cap: 100000)",
+            "type": "integer"
+          },
+          "line_numbers": {
+            "default": false,
+            "description": "If true, prefix each line with its 1-indexed line number",
+            "type": "boolean"
+          },
+          "start_line": {
+            "description": "Optional 1-indexed start line (overrides offset/max_chars when set)",
+            "type": "integer"
+          },
+          "end_line": {
+            "description": "Optional 1-indexed end line (inclusive)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "file_id"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "search_chats",
+      "description": "Search the user's previous chat conversations by title and message content.\nHelpful for finding details from earlier conversations.",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "description": "The search query to find matching chats",
+            "type": "string"
+          },
+          "count": {
+            "default": 5,
+            "description": "Maximum number of results to return (default: 5)",
+            "type": "integer"
+          },
+          "start_timestamp": {
+            "description": "Only include chats updated after this Unix timestamp (seconds)",
+            "type": "integer"
+          },
+          "end_timestamp": {
+            "description": "Only include chats updated before this Unix timestamp (seconds)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "view_chat",
+      "description": "Get the full conversation history of a chat by its ID after a relevant\nprevious chat has been identified.",
+      "input_schema": {
+        "properties": {
+          "chat_id": {
+            "description": "The ID of the chat to retrieve",
+            "type": "string"
+          }
+        },
+        "required": [
+          "chat_id"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "search_memories",
+      "description": "Search or browse saved memories by content, path, type, or memory ID.",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "default": "",
+            "description": "Optional query to search memory content and path",
+            "type": "string"
+          },
+          "count": {
+            "default": 5,
+            "description": "Number of memories to return (default 5)",
+            "type": "integer"
+          },
+          "type": {
+            "default": "all",
+            "description": "\"user\", \"context\", or \"all\"",
+            "type": "string"
+          },
+          "path": {
+            "description": "Optional memory path to search around",
+            "type": "string"
+          },
+          "memory_id": {
+            "description": "Optional exact memory ID to read",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "list_memory_paths",
+      "description": "List saved memory paths to find existing memory groups before writing or moving memories.",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "default": "",
+            "description": "Optional query to filter memory paths or contents",
+            "type": "string"
+          },
+          "count": {
+            "default": 100,
+            "description": "Maximum number of paths to return",
+            "type": "integer"
+          },
+          "type": {
+            "default": "all",
+            "description": "\"user\", \"context\", or \"all\"",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "read_memory_path",
+      "description": "Read saved memories at a memory path, including nearby parent and child paths.",
+      "input_schema": {
+        "properties": {
+          "path": {
+            "description": "Memory path to read",
+            "type": "string"
+          },
+          "count": {
+            "default": 50,
+            "description": "Maximum number of memories to return",
+            "type": "integer"
+          },
+          "type": {
+            "default": "all",
+            "description": "\"user\", \"context\", or \"all\"",
+            "type": "string"
+          },
+          "include_children": {
+            "default": true,
+            "description": "Include memories under child paths",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "list_memories",
+      "description": "List all stored memories for the user, including IDs and timestamps.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "update_memory",
+      "description": "Apply a batch of memory changes after learning enduring information.\n\nUse type \"user\" for facts, preferences, or instructions about the user.\nUse type \"context\" for other durable context that may help future chats.\nDo not save one-off activity, meals, routine daily events, temporary mood, or other short-lived details\nunless the user explicitly asks you to remember them.\nPath is optional. Use it as a stable memory address to group related memories.\nPrefer an existing path from list_memory_paths when one fits.\nLeave path empty when no useful grouping is clear.\n\nOperation shapes:\n- {\"action\": \"add\", \"content\": \"...\", \"type\": \"user\"|\"context\", \"path\": \"...\"}\n- {\"action\": \"replace\", \"id\": \"...\", \"content\": \"...\", \"type\": \"user\"|\"context\", \"path\": \"...\"}\n- {\"action\": \"move\", \"id\": \"...\", \"path\": \"...\"}\n- {\"action\": \"remove\", \"id\": \"...\"}",
+      "input_schema": {
+        "properties": {
+          "operations": {
+            "description": "Memory operations to apply in one request",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operations"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "add_memory",
+      "description": "Save enduring information that can improve future chats.\n\nSave stable preferences, goals, projects, relationships, habits, and standing instructions.\nDo not save one-off activity, meals, routine daily events, temporary mood, or other short-lived details\nunless the user explicitly asks you to remember them.",
+      "input_schema": {
+        "properties": {
+          "content": {
+            "description": "The memory content to store",
+            "type": "string"
+          },
+          "type": {
+            "default": "user",
+            "description": "Use \"user\" for facts/preferences about the user, or \"context\" for other durable context",
+            "type": "string"
+          },
+          "path": {
+            "description": "Optional stable memory address for grouping related memories",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "replace_memory_content",
+      "description": "Update an existing saved memory by its ID when its content needs correction.",
+      "input_schema": {
+        "properties": {
+          "memory_id": {
+            "description": "The ID of the memory to update",
+            "type": "string"
+          },
+          "content": {
+            "description": "The new content for the memory",
+            "type": "string"
+          },
+          "type": {
+            "description": "Optional \"user\" or \"context\" type for the updated memory",
+            "type": "string"
+          },
+          "path": {
+            "description": "Optional stable memory address for grouping related memories",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id",
+          "content"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "delete_memory",
+      "description": "Delete a saved memory by its ID.",
+      "input_schema": {
+        "properties": {
+          "memory_id": {
+            "description": "The ID of the memory to delete",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "search_web",
+      "description": "Search the public web for information. Best for current events, external references,\nor topics not covered in internal documents.",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "description": "The search query to look up",
+            "type": "string"
+          },
+          "count": {
+            "description": "Number of results to return (default: admin-configured value)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "fetch_url",
+      "description": "Fetch and extract the main text content from a web page URL.",
+      "input_schema": {
+        "properties": {
+          "url": {
+            "description": "The URL to fetch content from",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "create_tasks",
+      "description": "Create a visible task checklist for multi-step work so progress can be shown in chat.",
+      "input_schema": {
+        "properties": {
+          "tasks": {
+            "description": "List of task items. Each item: content (string, required), status (pending|in_progress|completed|cancelled, default pending), id (optional, auto-generated).",
+            "items": {
+              "properties": {
+                "id": {
+                  "description": "Unique identifier for the task. Auto-generated if omitted.",
+                  "type": "string"
+                },
+                "content": {
+                  "description": "Task description.",
+                  "type": "string"
+                },
+                "status": {
+                  "default": "pending",
+                  "description": "Task status.",
+                  "enum": [
+                    "pending",
+                    "in_progress",
+                    "completed",
+                    "cancelled"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "content"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tasks"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true
+    },
+    {
+      "name": "update_task",
+      "description": "Mark a single visible task item as completed, in_progress, pending, or cancelled.",
+      "input_schema": {
+        "properties": {
+          "id": {
+            "description": "The task ID to update",
+            "type": "string"
+          },
+          "status": {
+            "default": "completed",
+            "description": "New status: completed, in_progress, pending, or cancelled (default: completed)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "eager_input_streaming": true,
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "stream": true
+}
