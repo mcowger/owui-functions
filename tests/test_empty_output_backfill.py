@@ -128,8 +128,7 @@ def _build_ctx(cfg):
     TurnContext = responses_mod.TurnContext
     return TurnContext(
         runtime_config=cfg,
-        model_id="gpt-5.5",
-        features=set(),
+        model_id="gpt-5.1",
         metadata={"chat_id": None, "message_id": "m1", "owui_model_id": None},
     )
 
@@ -183,7 +182,7 @@ def test_backfills_output_and_executes_tool_when_completed_output_empty():
     ctx = _build_ctx(cfg)
     events = _CollectingEvents()
     executor = _RecordingExecutor()
-    request = responses_mod.ResponsesRequest(model="gpt-5.5", input=[], stream=True)
+    request = {"model": "gpt-5.1", "input": [], "stream": True}
 
     result = asyncio.run(
         engine.run_streaming_turn(

@@ -79,10 +79,10 @@ class PipeValves(BaseModel):
         description="Your OpenAI API key. Defaults to the value of the OPENAI_API_KEY environment variable (blank if unset).",
     )
     MODEL_ID: str = Field(
-        default="gpt-5-auto, gpt-5-chat-latest, gpt-5-thinking, gpt-5-thinking-high, gpt-5-thinking-minimal, gpt-4.1-nano, chatgpt-4o-latest, o3, gpt-4o",
+        default="gpt-5.1, gpt-5.1-chat-latest, gpt-5, gpt-5-mini, o3, o4-mini",
         description=(
             "Comma separated OpenAI model IDs. Each ID becomes a model entry in WebUI. "
-            "Supports all official OpenAI model IDs and pseudo IDs (see README.md for full list)."
+            "Use official OpenAI Responses API model IDs (gpt-5.x and later, o-series)."
         ),
     )
     REASONING_SUMMARY: Literal["auto", "concise", "detailed", "disabled"] = Field(
@@ -487,294 +487,32 @@ __all__ = [
 ]
 
 # === core/model_catalog.py ===
-"""Single source of truth for OpenAI model IDs, aliases, and capabilities."""
+"""Model identifier helpers.
 
-import re
-from copy import deepcopy
-from typing import Any, Mapping
+We only support modern OpenAI models (gpt-5.x and later, o-series). All of
+them support reasoning and the built-in tools, so there is no capability
+table or alias machinery here — just identifier normalization used to strip
+the Open WebUI manifold prefix.
 
-# [build.py] internal imports removed in monolith:
-# from openai_responses_manifold.core.logging import get_logger
+Open WebUI prefixes manifold model IDs with the function id and a dot, e.g.
+``openai_responses_manifold.gpt-5.4`` or ``openai_responses.gpt-5.1``. Because
+model IDs themselves contain dots (``gpt-5.4``), we strip only a leading
+``openai_responses...`` namespace segment up to its first dot.
+"""
 
-# =============================================================================
-# Change Log
-# 2025-11-20: Align model feature flags with current OpenAI docs (web search,
-#             file search, image generation, and code interpreter coverage),
-#             add gpt-5-pro and Codex models, adjust deep-research and chat
-#             model capabilities to match Responses API model cards.
-# =============================================================================
+import re as _re
 
-# Feature flags:
-# - function_calling       → Supports custom tools / function calling in Responses.
-# - reasoning              → Supports `reasoning` options (reasoning models).
-# - reasoning_summary      → Supports reasoning summaries / traces.
-# - web_search_tool        → Built-in Web search tool in Responses.
-# - file_search_tool       → Built-in File search / retrieval tool in Responses.
-# - image_gen_tool         → Built-in Image generation tool in Responses.
-# - code_interpreter_tool  → Built-in Code interpreter tool in Responses.
-# - deep_research          → Deep research orchestration models.
-# - verbosity              → Supports `text.verbosity` parameter.
-FUNCTION_TOOL = "function_calling"
-REASONING = "reasoning"
-REASONING_SUMMARY = "reasoning_summary"
-WEB_SEARCH = "web_search_tool"
-FILE_SEARCH = "file_search_tool"
-IMAGE_GEN = "image_gen_tool"
-CODE_INTERPRETER = "code_interpreter_tool"
-DEEP_RESEARCH = "deep_research"
-VERBOSITY = "verbosity"
-
-GPT5_REASONING_FEATURES = {
-    FUNCTION_TOOL,
-    REASONING,
-    REASONING_SUMMARY,
-    WEB_SEARCH,
-    FILE_SEARCH,
-    IMAGE_GEN,
-    CODE_INTERPRETER,
-    VERBOSITY,
-}
-GPT5_CODEX_FEATURES = {
-    FUNCTION_TOOL,
-    REASONING,
-    REASONING_SUMMARY,
-    WEB_SEARCH,
-    FILE_SEARCH,
-    CODE_INTERPRETER,
-}
-CHAT_TOOL_FEATURES = {
-    FUNCTION_TOOL,
-    WEB_SEARCH,
-    FILE_SEARCH,
-    IMAGE_GEN,
-    CODE_INTERPRETER,
-}
-GPT4_NANO_FEATURES = {FUNCTION_TOOL, IMAGE_GEN, CODE_INTERPRETER}
-O_SERIES_FEATURES = {
-    FUNCTION_TOOL,
-    REASONING,
-    REASONING_SUMMARY,
-    WEB_SEARCH,
-    FILE_SEARCH,
-    IMAGE_GEN,
-    CODE_INTERPRETER,
-}
-O3_PRO_FEATURES = {FUNCTION_TOOL, REASONING, WEB_SEARCH, FILE_SEARCH, IMAGE_GEN}
-DEEP_RESEARCH_FEATURES = {REASONING, REASONING_SUMMARY, DEEP_RESEARCH, WEB_SEARCH, FILE_SEARCH}
-FUTURE_OPENAI_BASELINE_FEATURES = {FUNCTION_TOOL, REASONING, REASONING_SUMMARY, WEB_SEARCH}
-UNKNOWN_MODEL_BASELINE_FEATURES = {FUNCTION_TOOL}
+_PREFIX_RE = _re.compile(r"^openai_responses[^.]*\.")
 
 
-def _models(profile: set[str], *model_ids: str) -> dict[str, set[str]]:
-    """Assign a reusable capability profile to model identifiers."""
-
-    return {model_id: set(profile) for model_id in model_ids}
-
-
-# Exact overrides remain small; future models are covered by inference rules below.
-MODEL_FEATURES: dict[str, set[str]] = {
-    **_models(
-        GPT5_REASONING_FEATURES,
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.4-nano",
-        "gpt-5-auto",
-        "gpt-5.1",
-        "gpt-5.1-pro",
-        "gpt-5-pro",
-        "gpt-5",
-        "gpt-5-mini",
-        "gpt-5-nano",
-    ),
-    **_models(
-        GPT5_CODEX_FEATURES,
-        "gpt-5.1-codex",
-        "gpt-5.1-codex-max",
-        "gpt-5.1-codex-mini",
-        "gpt-5-codex",
-        "codex-mini-latest",
-    ),
-    **_models(CHAT_TOOL_FEATURES, "gpt-5.1-chat-latest", "gpt-5-chat-latest"),
-    **_models(CHAT_TOOL_FEATURES, "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"),
-    **_models(GPT4_NANO_FEATURES, "gpt-4.1-nano"),
-    **_models(O_SERIES_FEATURES, "o3", "o3-mini", "o4-mini"),
-    **_models(O3_PRO_FEATURES, "o3-pro"),
-    **_models(DEEP_RESEARCH_FEATURES, "o3-deep-research", "o4-mini-deep-research"),
-    "chatgpt-4o-latest": set(),
-}
-
-_FEATURE_INFERENCE_RULES: tuple[tuple[re.Pattern[str], set[str]], ...] = (
-    (re.compile(r"^chatgpt-4o-latest$"), set()),
-    (re.compile(r"^gpt-5(?:\.\d+)?-chat-latest$"), CHAT_TOOL_FEATURES),
-    (re.compile(r"^(?:gpt-5(?:\.\d+)?-codex(?:-.+)?|codex-.+)$"), GPT5_CODEX_FEATURES),
-    (re.compile(r"^gpt-5(?:\.\d+)?(?:-(?:mini|nano|pro|auto))?$"), GPT5_REASONING_FEATURES),
-    (re.compile(r"^gpt-4\.1-nano$"), GPT4_NANO_FEATURES),
-    (re.compile(r"^(?:gpt-4\.1(?:-mini)?|gpt-4o(?:-mini)?)$"), CHAT_TOOL_FEATURES),
-    (re.compile(r"^o\d+(?:-mini)?-deep-research$"), DEEP_RESEARCH_FEATURES),
-    (re.compile(r"^o\d+-pro$"), O3_PRO_FEATURES),
-    (re.compile(r"^o\d+(?:-mini)?$"), O_SERIES_FEATURES),
-)
-_OPENAI_MODEL_ID_RE = re.compile(r"^(?:gpt-|o\d|codex-|chatgpt-)")
-
-# Add entries to MODEL_ALIASES for any pseudo-model name users can pick.
-# Each alias is a preset that points to a base model and optional default params,
-# e.g. gpt-5-thinking-high -> gpt-5 with reasoning effort fixed to high.
-MODEL_ALIASES: dict[str, dict[str, dict | str]] = {
-    "gpt-5.1-thinking": {
-        "base_model": "gpt-5.1",
-        "params": {"reasoning": {"effort": "medium"}},
-    },
-    "gpt-5.1-thinking-minimal": {
-        "base_model": "gpt-5.1",
-        "params": {"reasoning": {"effort": "minimal"}},
-    },
-    "gpt-5.1-thinking-high": {
-        "base_model": "gpt-5.1",
-        "params": {"reasoning": {"effort": "high"}},
-    },
-    "gpt-5-thinking": {
-        "base_model": "gpt-5",
-        "params": {"reasoning": {"effort": "medium"}},
-    },
-    "gpt-5-thinking-minimal": {
-        "base_model": "gpt-5",
-        "params": {"reasoning": {"effort": "minimal"}},
-    },
-    "gpt-5-thinking-high": {
-        "base_model": "gpt-5",
-        "params": {"reasoning": {"effort": "high"}},
-    },
-    "gpt-5-thinking-mini": {
-        "base_model": "gpt-5-mini",
-        "params": {"reasoning": {"effort": "medium"}},
-    },
-    "gpt-5-thinking-mini-minimal": {
-        "base_model": "gpt-5-mini",
-        "params": {"reasoning": {"effort": "minimal"}},
-    },
-    "gpt-5-thinking-mini-high": {
-        "base_model": "gpt-5-mini",
-        "params": {"reasoning": {"effort": "high"}},
-    },
-    "gpt-5-thinking-nano": {
-        "base_model": "gpt-5-nano",
-        "params": {"reasoning": {"effort": "medium"}},
-    },
-    "gpt-5-thinking-nano-minimal": {
-        "base_model": "gpt-5-nano",
-        "params": {"reasoning": {"effort": "minimal"}},
-    },
-    "gpt-5-thinking-nano-high": {
-        "base_model": "gpt-5-nano",
-        "params": {"reasoning": {"effort": "high"}},
-    },
-    "o3-mini-high": {
-        "base_model": "o3-mini",
-        "params": {"reasoning": {"effort": "high"}},
-    },
-    "o4-mini-high": {
-        "base_model": "o4-mini",
-        "params": {"reasoning": {"effort": "high"}},
-    },
-}
-
-_PREFIX = "openai_responses."
-_DATE_SUFFIX_RE = re.compile(r"-\d{4}-\d{2}-\d{2}$")
-_KNOWN_IDS = frozenset({*MODEL_FEATURES.keys(), *MODEL_ALIASES.keys()})
-_logger = get_logger(__name__)
-_UNKNOWN_LOGGED: set[str] = set()
-
-
-def normalize(model_id: str) -> str:
-    """Normalize identifiers by lowercasing, trimming, and removing prefixes/dates."""
+def base_model(model_id: str) -> str:
+    """Strip the manifold prefix and whitespace from a model identifier."""
 
     raw = (model_id or "").strip()
-    if raw.startswith(_PREFIX):
-        raw = raw[len(_PREFIX) :]
-    raw = raw.lower()
-    if not raw:
-        return ""
-
-    # Drop trailing date suffix if present (e.g. -2025-10-06).
-    no_date = _DATE_SUFFIX_RE.sub("", raw)
-    if no_date in _KNOWN_IDS:
-        return no_date
-
-    # Some official IDs are like gpt-5.1-2025-11-13; if the portion
-    # after the first dot matches a known ID, use that.
-    dot_index = no_date.find(".")
-    if dot_index != -1:
-        suffix = _DATE_SUFFIX_RE.sub("", no_date[dot_index + 1 :])
-        if suffix in _KNOWN_IDS:
-            return suffix
-
-    return no_date
+    return _PREFIX_RE.sub("", raw)
 
 
-def base_model(
-    model_id: str, alias_lookup: Mapping[str, Mapping[str, str | dict]] | None = None
-) -> str:
-    """Return the canonical base model for a given identifier."""
-
-    alias_map = alias_lookup or MODEL_ALIASES
-    normalized = normalize(model_id)
-    alias_entry = alias_map.get(normalized)
-    if alias_entry:
-        base = alias_entry.get("base_model")
-        if isinstance(base, str):
-            return normalize(base)
-    return normalized
-
-
-def alias_defaults(model_id: str) -> dict[str, Any]:
-    """Return default parameters defined for a pseudo-model alias."""
-
-    params = MODEL_ALIASES.get(normalize(model_id), {}).get("params")
-    return deepcopy(params) if params else {}
-
-
-def _infer_features(model_id: str) -> set[str] | None:
-    """Infer capabilities for known model families not listed explicitly."""
-
-    for pattern, feature_set in _FEATURE_INFERENCE_RULES:
-        if pattern.match(model_id):
-            return set(feature_set)
-    if _OPENAI_MODEL_ID_RE.match(model_id):
-        return set(FUTURE_OPENAI_BASELINE_FEATURES)
-    return set(UNKNOWN_MODEL_BASELINE_FEATURES)
-
-
-def features(model_id: str) -> set[str]:
-    """Return the capability set for the canonical base model."""
-
-    canonical = base_model(model_id, MODEL_ALIASES)
-    feature_set = MODEL_FEATURES.get(canonical)
-    if feature_set is not None:
-        return set(feature_set)
-
-    inferred = _infer_features(canonical)
-    if inferred is not None:
-        return inferred
-
-    return set()
-
-
-def supports(feature: str, model_id: str) -> bool:
-    """Determine whether the supplied model exposes a feature."""
-
-    return feature in features(model_id)
-
-
-__all__ = [
-    "MODEL_FEATURES",
-    "MODEL_ALIASES",
-    "alias_defaults",
-    "features",
-    "supports",
-    "normalize",
-    "base_model",
-]
+__all__ = ["base_model"]
 
 # === core/markers.py ===
 """Helpers for encoding and parsing invisible history markers.
@@ -940,300 +678,43 @@ __all__ = [
 ]
 
 # === openai_api/types.py ===
-"""Typed models for the OpenAI Responses API.
+"""Helpers for the OpenAI Responses API.
 
-See ``docs/responses_engine.md`` and ``docs/routing_and_model_catalog.md``
-for the behavioral contract. The classes here intentionally model only the
-fields used by the manifold so they remain lightweight and easy to parse in
-tests.
+We rely on the OpenAI SDK for all request/response modeling. This module only
+provides two tiny helpers:
+
+* :func:`event_to_dict` — normalize an SDK streaming event (or raw mapping)
+  into a plain ``dict`` keyed by ``type`` (the raw API JSON shape). The engine
+  consumes these dicts directly, so new event types require no code changes.
+* :func:`prepare_payload` — drop ``None`` values from a request dict before
+  handing it to ``client.responses.create(**payload)``.
 """
-import json
-from copy import deepcopy
-from typing import Any, Literal, Mapping, Optional, Type
+from typing import Any, Mapping
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
 
-# [build.py] internal imports removed in monolith:
-# from ..core import alias_defaults, base_model, normalize
+def event_to_dict(event: Any) -> dict[str, Any]:
+    """Normalize an SDK event / mapping into a plain dict."""
 
+    if isinstance(event, dict):
+        return event
+    if hasattr(event, "model_dump"):
+        return event.model_dump(exclude_none=True)
+    if hasattr(event, "dict"):
+        return event.dict()
+    return {"type": getattr(event, "type", type(event).__name__), "value": str(event)}
 
-class StreamOptions(BaseModel):
-    """Streaming options accepted by the Responses API."""
 
-    include_obfuscation: bool | None = None
+# Backwards-compatible alias used by tests and the engine.
+parse_responses_event = event_to_dict
 
-    model_config = ConfigDict(extra="forbid")
 
+def prepare_payload(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a JSON-ready request dict with ``None`` values removed."""
 
-class ResponsesRequest(BaseModel):
-    """Request body for the OpenAI Responses API.
+    return {key: value for key, value in dict(request).items() if value is not None}
 
-    The model validator normalizes model aliases and overlays any alias
-    defaults (e.g. reasoning effort) without overwriting explicit user
-    choices.
-    """
 
-    model: str
-    input: str | list[dict[str, Any]] | None = None
-    instructions: str | None = None
-    stream: bool = False
-    store: bool | None = True
-    background: bool | None = False
-    conversation: str | dict[str, Any] | None = None
-    include: list[str] | None = None
-    max_output_tokens: int | None = None
-    max_tool_calls: int | None = None
-    metadata: dict[str, str] | None = None
-    parallel_tool_calls: bool | None = True
-    previous_response_id: str | None = None
-    prompt: dict[str, Any] | None = None
-    prompt_cache_key: str | None = None
-    prompt_cache_retention: str | None = None
-    reasoning: dict[str, Any] | None = None
-    safety_identifier: str | None = None
-    service_tier: str | None = None
-    stream_options: StreamOptions | None = None
-    temperature: float | None = 1.0
-    top_p: float | None = 1.0
-    top_logprobs: int | None = None
-    tool_choice: str | dict[str, Any] | None = None
-    tools: list[dict[str, Any]] | None = None
-    truncation: str | None = "disabled"
-    text: dict[str, Any] | None = None
-    model_router_result: dict[str, Any] | None = None
-    user: str | None = None
-
-    model_config = ConfigDict(extra="forbid")
-
-    @model_validator(mode="after")
-    def _apply_model_alias_defaults(self) -> "ResponsesRequest":
-        """Normalize model aliases and merge default parameters.
-
-        * ``model`` is normalized to the canonical base model using
-          ``model_catalog.base_model``.
-        * Any alias-implied defaults are deep-merged into the request **only
-          when a value is not already provided**.
-        """
-
-        original_model = self.model or ""
-        canonical_model = base_model(original_model)
-        defaults = alias_defaults(original_model) or {}
-
-        if canonical_model == normalize(original_model) and not defaults:
-            return self
-
-        data = json.loads(self.model_dump_json(exclude_none=False))
-        data["model"] = canonical_model
-
-        if defaults:
-            _deep_overlay(data, defaults)
-
-        for key, value in data.items():
-            setattr(self, key, value)
-        return self
-
-
-def _deep_overlay(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
-    """Merge ``src`` onto ``dst`` without overwriting explicit values."""
-
-    for key, value in src.items():
-        if isinstance(value, dict):
-            node = dst.get(key)
-            if isinstance(node, dict):
-                _deep_overlay(node, value)
-            elif node is None:
-                dst[key] = deepcopy(value)
-        elif isinstance(value, list):
-            existing = dst.get(key)
-            if isinstance(existing, list):
-                seen: set[str] = set()
-                merged: list[Any] = []
-                for item in existing + value:
-                    marker = _stable_json_key(item)
-                    if marker not in seen:
-                        seen.add(marker)
-                        merged.append(item)
-                dst[key] = merged
-            elif existing is None:
-                dst[key] = list(value)
-        else:
-            if key not in dst or dst.get(key) is None:
-                dst[key] = value
-    return dst
-
-
-def _stable_json_key(value: Any) -> str:
-    """Produce a stable key for deduplicating list entries."""
-
-    try:
-        return json.dumps(value, sort_keys=True)
-    except Exception:
-        return str(id(value))
-
-
-class ResponseEvent(BaseModel):
-    """Base class for streaming response events."""
-
-    type: str
-    sequence_number: Optional[int] = None
-
-    model_config = ConfigDict(extra="ignore")
-
-
-class ResponseOutputTextDeltaEvent(ResponseEvent):
-    type: Literal["response.output_text.delta"] = "response.output_text.delta"
-    output_index: Optional[int] = None
-    item_id: Optional[str] = None
-    content_index: Optional[int] = None
-    delta: Optional[str] = None
-    logprobs: list[Any] | None = None
-    obfuscation: str | None = None
-
-
-class ResponseReasoningSummaryTextDoneEvent(ResponseEvent):
-    type: Literal["response.reasoning_summary_text.done"] = "response.reasoning_summary_text.done"
-    output_index: Optional[int] = None
-    item_id: Optional[str] = None
-    summary_index: Optional[int] = None
-    text: Optional[str] = None
-
-
-class ResponseOutputTextAnnotationAddedEvent(ResponseEvent):
-    type: Literal["response.output_text.annotation.added"] = "response.output_text.annotation.added"
-    output_index: Optional[int] = None
-    item_id: Optional[str] = None
-    content_index: Optional[int] = None
-    annotation_index: Optional[int] = None
-    annotation: dict[str, Any] | None = None
-
-
-class ResponseOutputItemAddedEvent(ResponseEvent):
-    type: Literal["response.output_item.added"] = "response.output_item.added"
-    output_index: Optional[int] = None
-    item: dict[str, Any] | None = None
-
-
-class ResponseOutputItemDoneEvent(ResponseEvent):
-    type: Literal["response.output_item.done"] = "response.output_item.done"
-    output_index: Optional[int] = None
-    item: dict[str, Any] | None = None
-
-
-class ResponseCodeInterpreterCallInProgressEvent(ResponseEvent):
-    type: Literal["response.code_interpreter_call.in_progress"] = "response.code_interpreter_call.in_progress"
-    output_index: Optional[int] = None
-
-
-class ResponseCodeInterpreterCallInterpretingEvent(ResponseEvent):
-    type: Literal["response.code_interpreter_call.interpreting"] = "response.code_interpreter_call.interpreting"
-    output_index: Optional[int] = None
-
-
-class ResponseCodeInterpreterCallCodeDeltaEvent(ResponseEvent):
-    type: Literal["response.code_interpreter_call.code.delta"] = "response.code_interpreter_call.code.delta"
-    output_index: Optional[int] = None
-    delta: Optional[str] = None
-
-
-class ResponseCodeInterpreterCallCodeDoneEvent(ResponseEvent):
-    type: Literal["response.code_interpreter_call.code.done"] = "response.code_interpreter_call.code.done"
-    output_index: Optional[int] = None
-    code: Optional[str] = None
-
-
-class ResponseCodeInterpreterCallCompletedEvent(ResponseEvent):
-    type: Literal["response.code_interpreter_call.completed"] = "response.code_interpreter_call.completed"
-    output_index: Optional[int] = None
-
-
-class ResponseCompletedEvent(ResponseEvent):
-    type: Literal["response.completed"] = "response.completed"
-    response: dict[str, Any]
-
-
-class ResponseIncompleteEvent(ResponseEvent):
-    type: Literal["response.incomplete"] = "response.incomplete"
-    error_message: str | None = None
-    response: dict[str, Any] | None = None
-
-
-class ResponseFailedEvent(ResponseEvent):
-    type: Literal["response.failed"] = "response.failed"
-    error_message: str | None = None
-    response: dict[str, Any] | None = None
-
-
-ResponsesEvent = ResponseEvent
-_RESPONSES_REQUEST_ADAPTER = TypeAdapter(ResponsesRequest)
-
-
-_EVENT_TYPE_MAP: dict[str, Type[ResponseEvent]] = {
-    "response.output_text.delta": ResponseOutputTextDeltaEvent,
-    "response.output_text.annotation.added": ResponseOutputTextAnnotationAddedEvent,
-    "response.output_item.added": ResponseOutputItemAddedEvent,
-    "response.output_item.done": ResponseOutputItemDoneEvent,
-    "response.reasoning_summary_text.done": ResponseReasoningSummaryTextDoneEvent,
-    "response.code_interpreter_call.in_progress": ResponseCodeInterpreterCallInProgressEvent,
-    "response.code_interpreter_call.interpreting": ResponseCodeInterpreterCallInterpretingEvent,
-    "response.code_interpreter_call.code.delta": ResponseCodeInterpreterCallCodeDeltaEvent,
-    "response.code_interpreter_call.code.done": ResponseCodeInterpreterCallCodeDoneEvent,
-    "response.code_interpreter_call.completed": ResponseCodeInterpreterCallCompletedEvent,
-    "response.completed": ResponseCompletedEvent,
-    "response.incomplete": ResponseIncompleteEvent,
-    "response.failed": ResponseFailedEvent,
-}
-
-
-def parse_responses_event(payload: Mapping[str, Any] | ResponseEvent) -> ResponseEvent:
-    """Coerce a raw payload into a typed ``ResponseEvent``.
-
-    Unknown ``type`` values fall back to the base ``ResponseEvent`` so new
-    event types from the API do not raise validation errors.
-    """
-
-    if isinstance(payload, ResponseEvent):
-        return payload
-    event_type = str(payload.get("type")) if isinstance(payload.get("type"), str) else None
-    model: Type[ResponseEvent] = _EVENT_TYPE_MAP.get(event_type, ResponseEvent)
-    return model.model_validate(payload)
-
-
-def validate_responses_request(payload: ResponsesRequest | Mapping[str, Any]) -> ResponsesRequest:
-    """Coerce/validate a payload into a ``ResponsesRequest`` instance."""
-
-    if isinstance(payload, ResponsesRequest):
-        return payload
-    return _RESPONSES_REQUEST_ADAPTER.validate_python(payload)
-
-
-def dump_responses_request(payload: ResponsesRequest | Mapping[str, Any]) -> dict[str, Any]:
-    """Return a JSON-ready dict with ``exclude_none=True`` applied."""
-
-    return validate_responses_request(payload).model_dump(exclude_none=True)
-
-
-__all__ = [
-    "ResponseEvent",
-    "ResponsesEvent",
-    "ResponsesRequest",
-    "ResponseCompletedEvent",
-    "ResponseFailedEvent",
-    "ResponseIncompleteEvent",
-    "ResponseOutputItemAddedEvent",
-    "ResponseOutputItemDoneEvent",
-    "ResponseCodeInterpreterCallInProgressEvent",
-    "ResponseCodeInterpreterCallInterpretingEvent",
-    "ResponseCodeInterpreterCallCodeDeltaEvent",
-    "ResponseCodeInterpreterCallCodeDoneEvent",
-    "ResponseCodeInterpreterCallCompletedEvent",
-    "ResponseOutputTextAnnotationAddedEvent",
-    "ResponseOutputTextDeltaEvent",
-    "ResponseReasoningSummaryTextDoneEvent",
-    "StreamOptions",
-    "dump_responses_request",
-    "parse_responses_event",
-    "validate_responses_request",
-]
+__all__ = ["event_to_dict", "parse_responses_event", "prepare_payload"]
 
 # === openai_api/client.py ===
 """Thin OpenAI SDK client for the OpenAI Responses API."""
@@ -1243,17 +724,16 @@ from typing import Any, AsyncIterator
 from openai import AsyncOpenAI
 
 # [build.py] internal imports removed in monolith:
-# from .types import (
-#     ResponseEvent,
-#     ResponsesRequest,
-#     dump_responses_request,
-#     parse_responses_event,
-#     validate_responses_request,
-# )
+# from .types import event_to_dict, prepare_payload
 
 
 class OpenAIClient:
-    """HTTP client for the OpenAI Responses API."""
+    """HTTP client for the OpenAI Responses API.
+
+    Requests are plain dicts passed straight through to the SDK, so any field
+    the Responses API supports works without changes here. Streaming events
+    and responses are normalized to plain dicts for the engine.
+    """
 
     def __init__(self) -> None:
         self._clients: dict[tuple[str, str], AsyncOpenAI] = {}
@@ -1274,41 +754,29 @@ class OpenAIClient:
 
     async def stream_responses(
         self,
-        request: ResponsesRequest | dict[str, Any],
+        request: dict[str, Any],
         *,
         base_url: str,
         api_key: str,
-    ) -> AsyncIterator[ResponseEvent]:
+    ) -> AsyncIterator[dict[str, Any]]:
         client = self._get_client(base_url=base_url, api_key=api_key)
-        payload = dump_responses_request(validate_responses_request(request))
+        payload = prepare_payload(request)
         payload["stream"] = True
         stream = await client.responses.create(**payload)
         async for event in stream:
-            yield parse_responses_event(_sdk_model_to_dict(event))
+            yield event_to_dict(event)
 
     async def create_response(
         self,
-        request: ResponsesRequest | dict[str, Any],
+        request: dict[str, Any],
         *,
         base_url: str,
         api_key: str,
     ) -> dict[str, Any]:
         client = self._get_client(base_url=base_url, api_key=api_key)
-        payload = dump_responses_request(validate_responses_request(request))
+        payload = prepare_payload(request)
         response = await client.responses.create(**payload)
-        return _sdk_model_to_dict(response)
-
-
-def _sdk_model_to_dict(value: Any) -> dict[str, Any]:
-    """Convert OpenAI SDK Pydantic-like objects to plain dictionaries."""
-
-    if isinstance(value, dict):
-        return value
-    if hasattr(value, "model_dump"):
-        return value.model_dump(exclude_none=True)
-    if hasattr(value, "dict"):
-        return value.dict()
-    return {"type": getattr(value, "type", type(value).__name__), "value": str(value)}
+        return event_to_dict(response)
 
 
 __all__ = ["OpenAIClient"]
@@ -1334,7 +802,6 @@ class TurnContext:
 
     runtime_config: RuntimeConfig
     model_id: str
-    features: set[str] = field(default_factory=set)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1733,12 +1200,22 @@ from pydantic import (
 # [build.py] internal imports removed in monolith:
 # from openai_responses_manifold.core.config import RuntimeConfig
 # from openai_responses_manifold.core.logging import get_logger
-# from openai_responses_manifold.core.model_catalog import supports
 
 # [build.py] internal imports removed in monolith:
 # from .types import ToolCall, ToolResult
 
+import json as _json
+
 _logger = get_logger(__name__)
+
+
+def _stable_json_key(value: Any) -> str:
+    """Produce a stable key for deduplicating tool definitions."""
+
+    try:
+        return _json.dumps(value, sort_keys=True)
+    except Exception:
+        return str(id(value))
 
 
 @dataclass
@@ -1999,7 +1476,6 @@ class ToolPolicy:
     @staticmethod
     def build_responses_tools(
         model_id: str,
-        features: set[str],
         cfg: RuntimeConfig,
         registry: ToolRegistry,
         body_tools: list[dict] | None,
@@ -2007,13 +1483,9 @@ class ToolPolicy:
         mcp_tools: list[dict] | None,
         web_search_tools: list[dict] | None,
     ) -> list[dict]:
-        allow_function_tools = "function_calling" in features or supports(
-            "function_calling", model_id
-        )
-        allow_web_search_tools = "web_search_tool" in features or supports(
-            "web_search_tool", model_id
-        )
-
+        # All supported models accept function calling and the built-in tools,
+        # so tools are attached as requested; the API rejects anything a given
+        # model does not support.
         ordered_tools: list[dict] = []
 
         def extend_tools(candidates: Iterable[dict]) -> None:
@@ -2033,11 +1505,6 @@ class ToolPolicy:
         deduped: dict[tuple[str | None, str | None], dict] = {}
         for raw_tool in ordered_tools:
             tool_type = raw_tool.get("type")
-            if tool_type == "function" and not allow_function_tools:
-                continue
-            if tool_type == "web_search" and not allow_web_search_tools:
-                continue
-
             tool = deepcopy(raw_tool)
             if tool_type == "function" and cfg.ENABLE_STRICT_TOOL_CALLING:
                 params = tool.get("parameters") or {}
@@ -2083,24 +1550,15 @@ _logger = get_logger(__name__)
 
 
 def build_web_search_tools(
-    model_id: str,
-    features: set[str],
     cfg: RuntimeConfig,
     reasoning_effort: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return a ``web_search`` tool definition when enabled.
 
     The tool is included only when:
-    * The model advertises ``web_search_tool`` capability.
     * Web search is enabled via valves.
     * The effective reasoning effort is not explicitly ``"minimal"``.
     """
-
-    allow_web_search = "web_search_tool" in features or supports(
-        "web_search_tool", model_id
-    )
-    if not allow_web_search:
-        return []
 
     if reasoning_effort == "minimal":
         return []
@@ -2130,16 +1588,11 @@ def build_web_search_tools(
 
 
 def build_code_interpreter_tools(
-    model_id: str,
-    features: set[str],
     cfg: RuntimeConfig,
 ) -> list[dict[str, Any]]:
-    """Return a code_interpreter tool definition when enabled and supported."""
+    """Return a code_interpreter tool definition when enabled."""
 
-    allow_code_interpreter = "code_interpreter_tool" in features or supports(
-        "code_interpreter_tool", model_id
-    )
-    if not allow_code_interpreter or not cfg.ENABLE_CODE_INTERPRETER_TOOL:
+    if not cfg.ENABLE_CODE_INTERPRETER_TOOL:
         return []
 
     container: dict[str, Any] = {"type": "auto"}
@@ -2474,174 +1927,6 @@ __all__ = [
     "emit_pending_code_interpreter_result",
 ]
 
-# === domain/routing.py ===
-"""Routing helpers for GPT-5 pseudo-models.
-
-This module provides a small helper that resolves Open WebUI router
-pseudo-models (e.g. ``.gpt-5-auto-dev``) into concrete OpenAI models.
-See ``docs/routing_and_model_catalog.md`` for behavior details.
-"""
-
-import json
-from typing import Any
-
-# [build.py] internal imports removed in monolith:
-# from ..core import base_model, normalize, supports
-# from ..core.logging import get_logger
-# from ..openai_api.client import OpenAIClient
-# from ..openai_api.types import ResponsesRequest
-# from .types import RuntimeEvents, TurnContext
-
-logger = get_logger("openai_responses_manifold.routing")
-
-
-def _extract_output_text(response: dict[str, Any]) -> str:
-    for item in reversed(response.get("output", [])):
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        for block in item.get("content") or []:
-            if isinstance(block, dict) and block.get("type") == "output_text":
-                text = block.get("text")
-                if isinstance(text, str):
-                    return text
-    return ""
-
-
-def _parse_decision(raw: str) -> dict[str, Any]:
-    if not raw:
-        return {}
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        start, end = raw.find("{"), raw.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(raw[start : end + 1])
-            except json.JSONDecodeError:
-                return {}
-    except Exception:  # pragma: no cover - defensive
-        return {}
-    return {}
-
-
-async def route_auto_model(
-    client: OpenAIClient,
-    request: ResponsesRequest,
-    ctx: TurnContext,
-    tools: list[dict],
-    events: RuntimeEvents,
-) -> ResponsesRequest:
-    """Route GPT-5 auto pseudo-models to concrete models.
-
-    * ``.gpt-5-auto`` is treated as a temporary alias to
-      ``gpt-5.1-chat-latest`` with a notification.
-    * ``.gpt-5-auto-dev`` triggers a router call using a fast model and
-      applies the router's chosen model/reasoning effort when valid.
-    * On any error, the original request is returned unchanged.
-    """
-
-    owui_model_id = ctx.metadata.get("owui_model_id")
-    if not isinstance(owui_model_id, str):
-        return request
-
-    request.model = base_model(request.model)
-    normalized = normalize(owui_model_id)
-
-    if normalized.endswith("gpt-5-auto"):
-        request.model = "gpt-5.1-chat-latest"
-        await events.notification(
-            "Model router coming soon — using gpt‑5.1‑chat‑latest for now.",
-            level="info",
-        )
-        return request
-
-    if not normalized.endswith("gpt-5-auto-dev"):
-        return request
-
-    router_request = ResponsesRequest(
-        model="gpt-5-mini",
-        input=request.input,
-        instructions=(
-            "You are a routing assistant. Choose the best GPT-5 model for the "
-            "user request and available tools. Prefer gpt-5.1-chat-latest for "
-            "general chat, gpt-5 for complex reasoning, and gpt-5-mini for "
-            "simple or tool-heavy tasks."
-        ),
-        reasoning={"effort": "minimal"},
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "gpt5_router",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "model": {
-                            "type": "string",
-                            "enum": ["gpt-5.1-chat-latest", "gpt-5", "gpt-5-mini"],
-                        },
-                        "reasoning_effort": {
-                            "type": "string",
-                            "enum": ["minimal", "low", "medium", "high"],
-                        },
-                        "explanation": {
-                            "type": "string",
-                            "minLength": 3,
-                            "maxLength": 500,
-                        },
-                    },
-                    "required": ["model", "reasoning_effort", "explanation"],
-                    "additionalProperties": False,
-                },
-                "verbosity": "medium",
-            }
-        },
-    )
-
-    try:
-        router_response = await client.create_response(
-            router_request,
-            base_url=ctx.runtime_config.BASE_URL,
-            api_key=ctx.runtime_config.API_KEY,
-        )
-    except Exception:
-        logger.warning("Model router request failed", exc_info=True)
-        return request
-
-    decision = _parse_decision(_extract_output_text(router_response))
-    model = decision.get("model") if isinstance(decision, dict) else None
-    effort = decision.get("reasoning_effort") if isinstance(decision, dict) else None
-    explanation = decision.get("explanation") if isinstance(decision, dict) else None
-
-    if not (isinstance(model, str) and isinstance(effort, str) and isinstance(explanation, str)):
-        return request
-
-    request.model = model
-
-    if supports("reasoning", model):
-        reasoning = dict(request.reasoning or {})
-        reasoning["effort"] = effort
-        request.reasoning = reasoning
-
-    request.model_router_result = {
-        "model": model,
-        "reasoning_effort": effort,
-        "explanation": explanation,
-    }
-
-    await events.status(
-        (
-            f"Routing to {model} (effort: {effort})\n"
-            f"Explanation: {explanation}"
-        )
-    )
-
-    return request
-
-
-__all__ = ["route_auto_model"]
-
 # === domain/engine.py ===
 import datetime
 import json
@@ -2670,29 +1955,37 @@ from urllib.parse import urlparse, urlunparse
 #     TurnResult,
 #     TurnState,
 # )
-# from openai_responses_manifold.openai_api import (
-#     OpenAIClient,
-#     ResponseCodeInterpreterCallCodeDeltaEvent,
-#     ResponseCodeInterpreterCallCodeDoneEvent,
-#     ResponseCodeInterpreterCallCompletedEvent,
-#     ResponseCodeInterpreterCallInProgressEvent,
-#     ResponseCodeInterpreterCallInterpretingEvent,
-#     ResponseCompletedEvent,
-#     ResponseEvent,
-#     ResponseFailedEvent,
-#     ResponseIncompleteEvent,
-#     ResponseOutputItemAddedEvent,
-#     ResponseOutputItemDoneEvent,
-#     ResponseOutputTextAnnotationAddedEvent,
-#     ResponseOutputTextDeltaEvent,
-#     ResponseReasoningSummaryTextDoneEvent,
-#     ResponsesRequest,
-# )
+# from openai_responses_manifold.openai_api import OpenAIClient
 
 # [build.py] internal imports removed in monolith:
 # from .history import MARKER_PLACEHOLDER, HistoryManager
 
 _LOGGER = get_logger(__name__)
+
+_CODE_INTERPRETER_EVENT_TYPES = {
+    "response.code_interpreter_call.in_progress",
+    "response.code_interpreter_call.interpreting",
+    "response.code_interpreter_call.code.delta",
+    "response.code_interpreter_call.code.done",
+    "response.code_interpreter_call.completed",
+}
+
+
+def _response_error_message(response: dict[str, Any] | None, default: str) -> str:
+    """Extract a human-readable error message from a response snapshot."""
+
+    if isinstance(response, dict):
+        error = response.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                return message
+        details = response.get("incomplete_details")
+        if isinstance(details, dict):
+            reason = details.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                return reason
+    return default
 
 _SERVER_SIDE_TOOL_TYPES = {
     "web_search_call",
@@ -2858,7 +2151,7 @@ class ResponsesEngine:
 
     async def run_streaming_turn(
         self,
-        request: ResponsesRequest,
+        request: dict[str, Any],
         ctx: TurnContext,
         events: RuntimeEvents,
         history_key: dict[str, Any],
@@ -2870,10 +2163,6 @@ class ResponsesEngine:
         final_text: str = ""
 
         try:
-            if request.model_router_result:
-                await self._emit_routing_status(request.model_router_result, events)
-                request.model_router_result = None
-
             # Each iteration streams one response and executes any tool calls.
             # We need MAX_FUNCTION_CALL_LOOPS tool-call iterations PLUS one final
             # response to get the model's text answer, so range is +1.
@@ -2971,7 +2260,7 @@ class ResponsesEngine:
                 # previous_response_id is not used because proxy endpoints
                 # (e.g. LiteLLM) do not persist responses server-side and
                 # return response_not_found on the next request.
-                request.input = (request.input or []) + call_items + result_items
+                request["input"] = (request.get("input") or []) + call_items + result_items
         except Exception as exc:
             self._logger.exception("Streaming turn failed")
             state.error_message = state.error_message or f"Internal error: {exc}"
@@ -3056,11 +2345,11 @@ class ResponsesEngine:
 
         return result
 
-    async def run_task(self, request: ResponsesRequest, ctx: TurnContext) -> str:
-        request.stream = False
-        request.store = False
-        request.tools = None
-        request.include = None
+    async def run_task(self, request: dict[str, Any], ctx: TurnContext) -> str:
+        request["stream"] = False
+        request["store"] = False
+        request["tools"] = None
+        request["include"] = None
         response = await self._client.create_response(
             request,
             base_url=ctx.runtime_config.BASE_URL,
@@ -3089,7 +2378,7 @@ class ResponsesEngine:
     async def _stream_single_response(
         self,
         *,
-        request: ResponsesRequest,
+        request: dict[str, Any],
         ctx: TurnContext,
         state: TurnState,
         events: RuntimeEvents,
@@ -3103,7 +2392,7 @@ class ResponsesEngine:
         state.current_response_items = []
         async for event in self._client.stream_responses(request, base_url=base_url, api_key=api_key):
             response_payload = await self._handle_event(event, state, events, ctx)
-            if isinstance(event, (ResponseFailedEvent, ResponseIncompleteEvent)):
+            if event.get("type") in {"response.failed", "response.incomplete"}:
                 break
         # Defensive backfill: a conformant Responses API returns the complete
         # list of output items in the terminal response.completed snapshot.
@@ -3126,7 +2415,7 @@ class ResponsesEngine:
 
     async def _handle_event(
         self,
-        event: ResponseEvent,
+        event: dict[str, Any],
         state: TurnState,
         events: RuntimeEvents,
         ctx: TurnContext,
@@ -3134,20 +2423,13 @@ class ResponsesEngine:
         async def emit_status(description: str, **kwargs: Any) -> None:
             await events.status(description, **kwargs)
 
-        if isinstance(
-            event,
-            (
-                ResponseCodeInterpreterCallInProgressEvent,
-                ResponseCodeInterpreterCallInterpretingEvent,
-                ResponseCodeInterpreterCallCodeDeltaEvent,
-                ResponseCodeInterpreterCallCodeDoneEvent,
-                ResponseCodeInterpreterCallCompletedEvent,
-            ),
-        ):
+        event_type = event.get("type")
+
+        if event_type in _CODE_INTERPRETER_EVENT_TYPES:
             await handle_code_interpreter_event(event, state, emit_status, self._logger)
             return None
 
-        server_tool_phase = _server_tool_event_phase(getattr(event, "type", None))
+        server_tool_phase = _server_tool_event_phase(event_type)
         if server_tool_phase:
             tool_type, phase = server_tool_phase
             await _emit_server_tool_status(
@@ -3160,12 +2442,12 @@ class ResponsesEngine:
             )
             return None
 
-        if isinstance(event, ResponseOutputTextDeltaEvent):
+        if event_type == "response.output_text.delta":
             # Only emit deltas that belong to a message item (the final text
             # response). Deltas during reasoning or function_call items are
             # internal and should not appear in the chat content.
             if state.current_output_item_type == "message":
-                delta = event.delta or ""
+                delta = event.get("delta") or ""
                 if delta:
                     state.assistant_visible_text += delta
                     state.assistant_internal_text += delta
@@ -3175,17 +2457,18 @@ class ResponsesEngine:
                     "_handle_event: SUPPRESSED output_text delta because "
                     "current_output_item_type=%r (delta_preview=%r)",
                     state.current_output_item_type,
-                    (event.delta or "")[:80],
+                    (event.get("delta") or "")[:80],
                 )
             return None
 
-        if isinstance(event, ResponseReasoningSummaryTextDoneEvent):
-            if event.text:
+        if event_type == "response.reasoning_summary_text.done":
+            text = event.get("text")
+            if text:
                 import html as _html
                 block = (
                     f'<details type="reasoning" done="true">\n'
                     f"<summary>Thought</summary>\n"
-                    f"{_html.escape(event.text)}\n"
+                    f"{_html.escape(text)}\n"
                     f"</details>\n"
                 )
                 state.assistant_visible_text += block
@@ -3194,8 +2477,8 @@ class ResponsesEngine:
                 await events.delta(block)
             return None
 
-        if isinstance(event, ResponseOutputTextAnnotationAddedEvent):
-            annotation = event.annotation or {}
+        if event_type == "response.output_text.annotation.added":
+            annotation = event.get("annotation") or {}
             if annotation.get("type") == "url_citation":
                 url = annotation.get("url")
                 if not url:
@@ -3226,19 +2509,20 @@ class ResponsesEngine:
                     await events.citation(payload)
             return None
 
-        if isinstance(event, (ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent)):
-            item = event.item or {}
+        if event_type in {"response.output_item.added", "response.output_item.done"}:
+            is_done = event_type == "response.output_item.done"
+            item = event.get("item") or {}
             if item:
                 item_type = str(item.get("type") or "")
-                if isinstance(event, ResponseOutputItemAddedEvent):
-                    state.current_output_item_type = item_type
-                    self._logger.debug(
-                        "_handle_event: output item ADDED type=%r", item_type
-                    )
-                elif isinstance(event, ResponseOutputItemDoneEvent):
+                if is_done:
                     state.current_output_item_type = None
                     self._logger.debug(
                         "_handle_event: output item DONE type=%r", item_type
+                    )
+                else:
+                    state.current_output_item_type = item_type
+                    self._logger.debug(
+                        "_handle_event: output item ADDED type=%r", item_type
                     )
                 if item.get("type") == "code_interpreter_call":
                     await handle_code_interpreter_item(
@@ -3247,19 +2531,19 @@ class ResponsesEngine:
                         events,
                         self._logger,
                         emit_status,
-                        output_index=getattr(event, "output_index", None),
+                        output_index=event.get("output_index"),
                     )
                 elif item_type in _SERVER_SIDE_TOOL_TYPES:
                     await _emit_server_tool_status(
                         tool_type=item_type,
-                        phase="done" if isinstance(event, ResponseOutputItemDoneEvent) else "added",
+                        phase="done" if is_done else "added",
                         item=item,
                         state=state,
                         events=events,
                         logger=self._logger,
                     )
                     # Emit all sources from web_search_call.action.sources
-                    if item_type == "web_search_call" and isinstance(event, ResponseOutputItemDoneEvent):
+                    if item_type == "web_search_call" and is_done:
                         action = item.get("action") if isinstance(item.get("action"), dict) else {}
                         for src in (action.get("sources") or []):
                             if not isinstance(src, dict):
@@ -3288,7 +2572,7 @@ class ResponsesEngine:
                             }
                             await events.source(payload)
                             await events.citation(payload)
-                if isinstance(event, ResponseOutputItemDoneEvent):
+                if is_done:
                     # Track every completed output item for THIS response so we
                     # can backfill response.output if the terminal
                     # response.completed event returns an empty output array
@@ -3297,31 +2581,35 @@ class ResponsesEngine:
                     self._record_structured_item(item, state, ctx.runtime_config)
             return None
 
-        if isinstance(event, ResponseCompletedEvent):
-            state.response_text = json.dumps(event.response)
+        if event_type == "response.completed":
+            response = event.get("response") or {}
+            state.response_text = json.dumps(response)
             output_types = [
                 (it or {}).get("type")
-                for it in ((event.response or {}).get("output") or [])
+                for it in (response.get("output") or [])
             ]
             self._logger.debug(
-                "_handle_event: ResponseCompletedEvent output_item_types=%s",
+                "_handle_event: response.completed output_item_types=%s",
                 output_types,
             )
-            return event.response
+            return response
 
-        if isinstance(event, ResponseIncompleteEvent):
-            state.error_message = event.error_message or "Response incomplete"
+        if event_type == "response.incomplete":
+            response = event.get("response") or {}
+            state.error_message = _response_error_message(response, "Response incomplete")
             self._logger.debug(
-                "_handle_event: ResponseIncompleteEvent error=%r", state.error_message
+                "_handle_event: response.incomplete error=%r", state.error_message
             )
-            return event.response or {}
+            return response
 
-        if isinstance(event, ResponseFailedEvent):
-            state.error_message = event.error_message or "Response failed"
+        if event_type in {"response.failed", "response.error"}:
+            response = event.get("response") or {}
+            default = event.get("message") or "Response failed"
+            state.error_message = _response_error_message(response, default)
             self._logger.debug(
-                "_handle_event: ResponseFailedEvent error=%r", state.error_message
+                "_handle_event: %s error=%r", event_type, state.error_message
             )
-            return event.response or {}
+            return response
 
         return None
 
@@ -3388,18 +2676,6 @@ class ResponsesEngine:
                 }
             )
         return items
-
-    async def _emit_routing_status(self, router_result: dict[str, Any], events: RuntimeEvents) -> None:
-        model = router_result.get("model")
-        effort = router_result.get("reasoning_effort")
-        explanation = router_result.get("reason") or router_result.get("explanation")
-        parts = [str(model or "")]
-        if effort:
-            parts.append(f"effort={effort}")
-        if explanation:
-            parts.append(str(explanation))
-        message = ": ".join(filter(None, [", ".join(filter(None, parts[:-1])), parts[-1] if len(parts) > 1 else None]))
-        await events.status(message or "Routing decision applied", done=False)
 
     def _record_structured_item(self, item: dict[str, Any], state: TurnState, cfg: RuntimeConfig) -> None:
         state.structured_items.append(item)
@@ -3918,11 +3194,10 @@ import json
 from typing import Any, Tuple
 
 # [build.py] internal imports removed in monolith:
-# from openai_responses_manifold.core import base_model, features
+# from openai_responses_manifold.core import base_model
 # from openai_responses_manifold.core.config import RuntimeConfig
 # from openai_responses_manifold.domain.history import HistoryManager
 # from openai_responses_manifold.domain.types import TurnContext
-# from openai_responses_manifold.openai_api.types import ResponsesRequest
 
 
 def build_turn_context(
@@ -3943,7 +3218,6 @@ def build_turn_context(
     model_id = base_model(body_model or runtime_cfg.MODEL_ID)
 
     owui_model_id = metadata.get("model_id") or body_model or None
-    model_features = features(model_id)
     ctx_metadata = {
         "session_id": metadata.get("session_id"),
         "chat_id": metadata.get("chat_id"),
@@ -3955,7 +3229,6 @@ def build_turn_context(
     return TurnContext(
         runtime_config=runtime_cfg,
         model_id=model_id,
-        features=model_features,
         metadata=ctx_metadata,
     )
 
@@ -3966,7 +3239,7 @@ def map_completions_to_responses(
     ctx: TurnContext,
     history_manager: HistoryManager,
     history_key: dict,
-) -> Tuple[ResponsesRequest, list[dict], list[dict]]:
+) -> Tuple[dict[str, Any], list[dict], list[dict]]:
     messages = body.get("messages") or []
     input_items, instructions = history_manager.build_input_from_messages(
         messages=messages,
@@ -3975,27 +3248,22 @@ def map_completions_to_responses(
         openwebui_model_id=ctx.metadata.get("owui_model_id"),
     )
 
-    # Reasoning models reject temperature and top_p entirely.
-    is_reasoning_model = "reasoning" in ctx.features
-    temperature = None if is_reasoning_model else body.get("temperature")
-    top_p = None if is_reasoning_model else body.get("top_p")
-
-    request = ResponsesRequest(
-        model=ctx.model_id,
-        input=input_items,
-        instructions=instructions,
-        stream=True,
-        store=True,
-        temperature=temperature,
-        top_p=top_p,
-        top_logprobs=body.get("top_logprobs"),
-        truncation=body.get("truncation"),
-        max_output_tokens=body.get("max_tokens"),
-        reasoning={"effort": body.get("reasoning_effort")}
+    # We only support modern reasoning models, which reject temperature and
+    # top_p entirely, so they are never forwarded.
+    request: dict[str, Any] = {
+        "model": ctx.model_id,
+        "input": input_items,
+        "instructions": instructions,
+        "stream": True,
+        "store": True,
+        "top_logprobs": body.get("top_logprobs"),
+        "truncation": body.get("truncation"),
+        "max_output_tokens": body.get("max_tokens"),
+        "reasoning": {"effort": body.get("reasoning_effort")}
         if body.get("reasoning_effort")
         else None,
-        user=ctx.metadata.get("user_id") or ctx.metadata.get("user_email"),
-    )
+        "user": ctx.metadata.get("user_id") or ctx.metadata.get("user_email"),
+    }
 
     base_tools = body.get("tools") or []
     extra_tools = body.get("extra_tools") or []
@@ -4053,7 +3321,6 @@ from typing import Any, Iterable
 #     ToolPolicy,
 #     build_code_interpreter_tools,
 #     build_web_search_tools,
-#     route_auto_model,
 # )
 # from openai_responses_manifold.domain.history import HistoryManager
 # from openai_responses_manifold.openai_api import OpenAIClient
@@ -4145,22 +3412,18 @@ class Pipe:
     def _build_tools_for_request(
         self,
         *,
-        request: ResponsesRequest,
+        request: dict[str, Any],
         ctx: TurnContext,
         cfg: RuntimeConfig,
         registry: OpenWebUIToolRegistry,
         base_tools: list[dict],
         extra_tools: list[dict],
     ) -> None:
-        web_search_tools = build_web_search_tools(
-            model_id=ctx.model_id, features=ctx.features, cfg=cfg
-        )
-        code_interpreter_tools = build_code_interpreter_tools(
-            model_id=ctx.model_id, features=ctx.features, cfg=cfg
-        )
+        reasoning_effort = (request.get("reasoning") or {}).get("effort")
+        web_search_tools = build_web_search_tools(cfg, reasoning_effort=reasoning_effort)
+        code_interpreter_tools = build_code_interpreter_tools(cfg)
         tools_for_responses = ToolPolicy.build_responses_tools(
             model_id=ctx.model_id,
-            features=ctx.features,
             cfg=cfg,
             registry=registry,
             body_tools=base_tools,
@@ -4169,35 +3432,35 @@ class Pipe:
             web_search_tools=[*web_search_tools, *code_interpreter_tools],
         )
         if tools_for_responses:
-            request.tools = tools_for_responses
+            request["tools"] = tools_for_responses
 
-    def _apply_request_config(self, request: ResponsesRequest, cfg: RuntimeConfig, ctx: TurnContext) -> None:
-        request.truncation = cfg.TRUNCATION
-        request.prompt_cache_key = self._prompt_cache_key(cfg, ctx)
-        request.parallel_tool_calls = cfg.PARALLEL_TOOL_CALLS
+    def _apply_request_config(self, request: dict[str, Any], cfg: RuntimeConfig, ctx: TurnContext) -> None:
+        request["truncation"] = cfg.TRUNCATION
+        request["prompt_cache_key"] = self._prompt_cache_key(cfg, ctx)
+        request["parallel_tool_calls"] = cfg.PARALLEL_TOOL_CALLS
 
-        if "reasoning_summary" in ctx.features and cfg.REASONING_SUMMARY != "disabled":
-            request.reasoning = request.reasoning or {}
-            request.reasoning["summary"] = cfg.REASONING_SUMMARY
+        # All supported models are reasoning models.
+        reasoning = dict(request.get("reasoning") or {})
+        if cfg.REASONING_SUMMARY != "disabled":
+            reasoning["summary"] = cfg.REASONING_SUMMARY
+        if cfg.REASONING_EFFORT:
+            reasoning["effort"] = cfg.REASONING_EFFORT
+        if reasoning:
+            request["reasoning"] = reasoning
 
-        if "reasoning" in ctx.features and cfg.REASONING_EFFORT:
-            request.reasoning = request.reasoning or {}
-            request.reasoning["effort"] = cfg.REASONING_EFFORT
+        if cfg.PERSIST_REASONING_TOKENS != "disabled":
+            include = list(request.get("include") or [])
+            if "reasoning.encrypted_content" not in include:
+                include.append("reasoning.encrypted_content")
+            request["include"] = include
 
-        if "reasoning" in ctx.features and cfg.PERSIST_REASONING_TOKENS != "disabled":
-            request.include = list(request.include or [])
-            if "reasoning.encrypted_content" not in request.include:
-                request.include.append("reasoning.encrypted_content")
-
-        if cfg.WEB_SEARCH_INCLUDE_SOURCES and any(t.get("type") == "web_search" for t in (request.tools or [])):
-            request.include = list(request.include or [])
-            if "web_search_call.action.sources" not in request.include:
-                request.include.append("web_search_call.action.sources")
-
-    @staticmethod
-    def _is_auto_model(ctx: TurnContext) -> bool:
-        owui_model_id = (ctx.metadata.get("owui_model_id") or "").lower()
-        return owui_model_id.endswith(".gpt-5-auto") or owui_model_id.endswith(".gpt-5-auto-dev")
+        if cfg.WEB_SEARCH_INCLUDE_SOURCES and any(
+            t.get("type") == "web_search" for t in (request.get("tools") or [])
+        ):
+            include = list(request.get("include") or [])
+            if "web_search_call.action.sources" not in include:
+                include.append("web_search_call.action.sources")
+            request["include"] = include
 
     async def _persist_result_citations(
         self,
@@ -4280,10 +3543,10 @@ class Pipe:
                 request = map_completions_to_responses(
                     body=body, ctx=ctx, history_manager=self.history_manager, history_key=history_key
                 )[0]
-                request.stream = False
-                request.store = False
-                request.tools = None
-                request.include = None
+                request["stream"] = False
+                request["store"] = False
+                request["tools"] = None
+                request["include"] = None
                 return await self.engine.run_task(request, ctx)
 
             if body.get("stream") is False:
@@ -4304,11 +3567,6 @@ class Pipe:
                 extra_tools=extra_tools,
             )
             self._apply_request_config(request, cfg, ctx)
-
-            if self._is_auto_model(ctx):
-                request = await route_auto_model(
-                    client=self.client, request=request, ctx=ctx, tools=request.tools or [], events=events
-                )
 
             result = await self.engine.run_streaming_turn(
                 request=request,
