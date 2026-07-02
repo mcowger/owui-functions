@@ -3592,6 +3592,7 @@ __all__ = ["OpenWebUIRuntimeEvents"]
 import asyncio
 import inspect
 import json
+import uuid
 from typing import Any, Iterable
 
 # [build.py] internal imports removed in monolith:
@@ -3636,19 +3637,45 @@ class OpenWebUIToolRegistry(ToolRegistry):
 
 
 class OpenWebUIToolExecutor(ToolExecutor):
-    """Execute tool calls using callables from ``__tools__``."""
+    """Execute tool calls using callables from ``__tools__``.
 
-    def __init__(self, registry: dict[str, Any], *, parallel: bool = True):
+    Some Open WebUI tool registrations (e.g. Open Terminal's run_command,
+    list_files, glob_search, grep_search, write_file, etc. — any "direct"
+    tool-server tool) carry no local ``callable`` at all. Open WebUI
+    intentionally executes those client-side, in the browser, via a
+    WebSocket round-trip (``__event_call__`` -> ``{'type': 'execute:tool',
+    ...}``), exactly as its own native middleware does
+    (utils/middleware.py: tool_call_handler). ``event_call``/``metadata``
+    are threaded through here so this executor can dispatch those tools the
+    same way instead of reporting "Tool not found".
+    """
+
+    def __init__(
+        self,
+        registry: dict[str, Any],
+        *,
+        parallel: bool = True,
+        event_call: Any | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
         callables: dict[str, Any] = {}
+        direct_entries: dict[str, dict[str, Any]] = {}
         for entry in (registry or {}).values():
             if not isinstance(entry, dict):
                 continue
             name = entry.get("spec", {}).get("name") if isinstance(entry.get("spec"), dict) else None
+            if not isinstance(name, str) or not name:
+                continue
             fn = entry.get("callable")
-            if isinstance(name, str) and name and fn is not None:
+            if fn is not None:
                 callables[name] = fn
+            elif entry.get("direct"):
+                direct_entries[name] = entry
         self._callables = callables
+        self._direct_entries = direct_entries
         self._parallel = parallel
+        self._event_call = event_call
+        self._metadata = metadata or {}
 
     async def execute(self, calls: list[ToolCall]) -> list[ToolResult]:
         if not self._parallel or len(calls) <= 1:
@@ -3669,16 +3696,53 @@ class OpenWebUIToolExecutor(ToolExecutor):
 
         return list(await asyncio.gather(*(self._execute_one(call) for call in calls)))
 
-    async def _execute_one(self, call: ToolCall) -> ToolResult:
-        fn = self._callables.get(call.name)
-        if not fn:
+    async def _execute_direct(self, call: ToolCall, entry: dict[str, Any], args: dict) -> ToolResult:
+        if not callable(self._event_call):
             return ToolResult(
                 call_id=call.call_id,
-                output="Tool not found",
+                output=json.dumps(
+                    {
+                        "error": (
+                            f"Tool '{call.name}' is a direct tool-server tool and requires "
+                            "__event_call__ (browser round-trip) context, which is not "
+                            "available for this request."
+                        )
+                    }
+                ),
                 status="error",
-                error_message="Tool not found",
+                error_message="__event_call__ not available",
             )
 
+        try:
+            result = await self._event_call(
+                {
+                    "type": "execute:tool",
+                    "data": {
+                        "id": str(uuid.uuid4()),
+                        "name": call.name,
+                        "params": args,
+                        "server": entry.get("server", {}),
+                        "session_id": self._metadata.get("session_id"),
+                    },
+                }
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            return ToolResult(
+                call_id=call.call_id,
+                output=f"Direct tool error: {exc}",
+                status="error",
+                error_message=str(exc),
+            )
+
+        output = result if isinstance(result, str) else json.dumps(result, default=str)
+        return ToolResult(
+            call_id=call.call_id,
+            output=output,
+            status="ok",
+            error_message=None,
+        )
+
+    async def _execute_one(self, call: ToolCall) -> ToolResult:
         try:
             args = json.loads(call.arguments_json or "{}")
         except json.JSONDecodeError as exc:  # pragma: no cover - defensive
@@ -3687,6 +3751,18 @@ class OpenWebUIToolExecutor(ToolExecutor):
                 output=f"Invalid JSON arguments: {exc}",
                 status="error",
                 error_message=str(exc),
+            )
+
+        fn = self._callables.get(call.name)
+        if fn is None:
+            direct_entry = self._direct_entries.get(call.name)
+            if direct_entry is not None:
+                return await self._execute_direct(call, direct_entry, args)
+            return ToolResult(
+                call_id=call.call_id,
+                output="Tool not found",
+                status="error",
+                error_message="Tool not found",
             )
 
         try:
@@ -4070,7 +4146,12 @@ class Pipe:
             history_key = {"chat_id": (__metadata__ or {}).get("chat_id"), "pipe_id": self.id}
             resolved_tools = await self._resolve_tools(__tools__ or {})
             registry = OpenWebUIToolRegistry(resolved_tools)
-            executor = OpenWebUIToolExecutor(resolved_tools, parallel=cfg.PARALLEL_TOOL_CALLS)
+            executor = OpenWebUIToolExecutor(
+                resolved_tools,
+                parallel=cfg.PARALLEL_TOOL_CALLS,
+                event_call=__event_call__,
+                metadata=__metadata__,
+            )
 
             if __task__ is not None:
                 request = map_completions_to_responses(

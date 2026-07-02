@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.9.18
+version: 0.9.19
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.103.0
 environment_variables:
@@ -37,6 +37,28 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.19
+- Fixed Open WebUI "direct" tool-server tools (Open Terminal's run_command,
+  list_files, glob_search, grep_search, write_file, etc.) always failing
+  with "Tool '...' is not available". Root cause: these tools are
+  registered in __tools__ with {'direct': True, 'server': {...}} and no
+  local 'callable' — Open WebUI intentionally executes them client-side in
+  the browser via a WebSocket round-trip (__event_call__ ->
+  {'type': 'execute:tool', ...}), exactly like its own native middleware
+  (utils/middleware.py tool_call_handler). pipe() never declared/accepted
+  __event_call__ at all, so there was no code path to execute these tools.
+  Added __event_call__ to pipe()'s signature and a new
+  Pipe._dispatch_direct_tool() that mirrors OWUI's own direct-tool dispatch
+  contract (id/name/params/server/session_id), wired into
+  handle_tool_use_block_stop(). Confirmed against a reference
+  implementation of the same pattern (Skyzi000/open-webui-extensions).
+- Added extensive [TOOLS-DEBUG] INFO-level logging across pipe() entry,
+  create_request_payload, and _convert_tools_to_claude_format covering
+  __tools__ resolution, per-tool callable/direct/spec inspection, the
+  body_tools and __tools__ conversion loops (with skip/add reasons for
+  every tool), and the final outgoing tools_list — to make future tool
+  dispatch issues diagnosable from logs alone.
+
 v0.9.18
 - Removed "API tool passthrough" (api_tool_names/api_tool_passthrough): any
   tool the model calls is now always dispatched for real execution via
@@ -460,6 +482,7 @@ import base64
 import traceback
 import inspect
 import hashlib
+import uuid
 from datetime import datetime
 from collections.abc import Awaitable
 import asyncio
@@ -1035,11 +1058,15 @@ async def create_request_payload(
     )
     if __tools__:
         for _tn, _td in __tools__.items():
+            _callable_val = _td.get("callable") if isinstance(_td, dict) else None
             logger.info(
-                "[TOOLS-DEBUG] __tools__['%s']: type=%s has_callable=%s has_spec=%s spec_name=%r",
+                "[TOOLS-DEBUG] __tools__['%s']: type=%s callable_type=%s "
+                "callable_repr=%r all_keys=%s has_spec=%s spec_name=%r",
                 _tn,
                 type(_td).__name__,
-                bool(isinstance(_td, dict) and _td.get("callable")),
+                type(_callable_val).__name__,
+                _callable_val,
+                sorted(_td.keys()) if isinstance(_td, dict) else None,
                 bool(isinstance(_td, dict) and "spec" in _td),
                 (_td.get("spec") or {}).get("name") if isinstance(_td, dict) else None,
             )
@@ -2448,6 +2475,8 @@ async def handle_tool_use_block_stop(
     builtin_tools: dict[str, Any],
     running_tool_tasks: list[Any],
     emit_delta: Callable[[str], Awaitable[None]],
+    event_call: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]] = None,
+    metadata: Optional[dict[str, Any]] = None,
 ) -> str:
     if not tools_buffer:
         return tools_buffer
@@ -2472,6 +2501,17 @@ async def handle_tool_use_block_stop(
         tool_input = tool_call_data.get("input", {})
 
         tool = tools.get(tool_name) if tools else None
+        logger.info(
+            "[TOOLS-DEBUG] dispatch-decision for tool_name=%r: tool_entry_found=%s "
+            "callable_present=%s ENABLE_BASH_TOOL=%s ENABLE_TEXT_EDITOR_TOOL=%s "
+            "tool_input=%r",
+            tool_name,
+            tool is not None,
+            bool(isinstance(tool, dict) and tool.get("callable")),
+            pipe.valves.ENABLE_BASH_TOOL,
+            pipe.valves.ENABLE_TEXT_EDITOR_TOOL,
+            tool_input,
+        )
         if (
             tool_name == "bash"
             and pipe.valves.ENABLE_BASH_TOOL
@@ -2521,6 +2561,24 @@ async def handle_tool_use_block_stop(
                 tool_name,
                 len(running_tool_tasks),
             )
+        elif tool and tool.get("direct"):
+            args = tool_input if isinstance(tool_input, dict) else {}
+            task = asyncio.create_task(
+                pipe._await_tool_task_result(
+                    tool_call_data,
+                    pipe._dispatch_direct_tool(
+                        tool_name, args, tool, event_call, metadata
+                    ),
+                )
+            )
+            running_tool_tasks.append(task)
+            logger.info(
+                "🚀 Started direct tool-server execution via __event_call__ for "
+                "'%s' (task #%d, event_call_available=%s)",
+                tool_name,
+                len(running_tool_tasks),
+                callable(event_call),
+            )
         elif tool_name in builtin_tools and builtin_tools[tool_name].get("callable"):
             args = tool_input if isinstance(tool_input, dict) else {}
             task = asyncio.create_task(
@@ -2538,6 +2596,18 @@ async def handle_tool_use_block_stop(
         else:
             logger.warning(
                 "Tool '%s' not found in __tools__ or builtin_tools", tool_name
+            )
+            logger.info(
+                "[TOOLS-DEBUG] dispatch-fail for '%s': tools_has_key=%s "
+                "tool_entry=%r (type=%s) tool.get('callable')=%r | "
+                "tool_name in builtin_tools=%s builtin_entry=%r",
+                tool_name,
+                bool(tools and tool_name in tools),
+                tool,
+                type(tool).__name__,
+                tool.get("callable") if isinstance(tool, dict) else None,
+                tool_name in builtin_tools,
+                builtin_tools.get(tool_name),
             )
 
             async def error_result(tn=tool_name):
@@ -5135,6 +5205,64 @@ class Pipe:
         except (TypeError, ValueError):
             return str(result)
 
+    async def _dispatch_direct_tool(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        tool_entry: dict,
+        event_call: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]],
+        metadata: Optional[dict],
+    ) -> str:
+        """Execute an Open WebUI 'direct' tool-server tool (e.g. Open Terminal's
+        run_command/list_files/glob_search/etc.) via the __event_call__ round-trip
+        to the browser, exactly like Open WebUI's own native middleware does for
+        tool.get('direct') == True entries (see middleware.py tool_call_handler).
+
+        These tools have no local 'callable' — OWUI intentionally executes them
+        client-side (auth/session context lives in the browser), dispatched via
+        a WebSocket 'execute:tool' event that the frontend's executeTool() picks
+        up and forwards to executeToolServer().
+        """
+        if not callable(event_call):
+            return json.dumps(
+                {
+                    "error": (
+                        f"Tool '{tool_name}' is a direct tool-server tool and "
+                        "requires __event_call__ (browser round-trip) context, "
+                        "which is not available for this request."
+                    )
+                },
+                ensure_ascii=False,
+            )
+
+        session_id = (metadata or {}).get("session_id")
+        try:
+            result = await event_call(
+                {
+                    "type": "execute:tool",
+                    "data": {
+                        "id": str(uuid.uuid4()),
+                        "name": tool_name,
+                        "params": tool_input,
+                        "server": tool_entry.get("server", {}),
+                        "session_id": session_id,
+                    },
+                }
+            )
+        except Exception as e:
+            logger.error("Direct tool '%s' execution failed: %s", tool_name, e)
+            return json.dumps(
+                {"error": f"Direct tool '{tool_name}' execution failed: {e}"},
+                ensure_ascii=False,
+            )
+
+        if isinstance(result, str):
+            return result
+        try:
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(result)
+
     async def _dispatch_bash_tool(
         self,
         tool_input: dict,
@@ -6526,6 +6654,7 @@ class Pipe:
         __task__: Optional[dict[str, Any]] = None,
         __task_body__: Optional[dict[str, Any]] = None,
         __request__: Optional[Any] = None,
+        __event_call__: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]] = None,
     ):
 
         request_ctx = PipeRequestContext(pipe=self, event_emitter=__event_emitter__)
@@ -6542,7 +6671,8 @@ class Pipe:
             logger.info(
                 "[TOOLS-DEBUG] pipe() called: body.tools count=%d names=%s | "
                 "__tools__ arg type=%s | __metadata__.tools present=%s keys=%s | "
-                "__metadata__.terminal_id=%r",
+                "__metadata__.terminal_id=%r | __event_call__ available=%s | "
+                "__metadata__.session_id=%r",
                 len(body.get("tools") or []),
                 [
                     (t.get("function") or {}).get("name")
@@ -6553,6 +6683,8 @@ class Pipe:
                 bool((__metadata__ or {}).get("tools")),
                 sorted(((__metadata__ or {}).get("tools") or {}).keys()),
                 (__metadata__ or {}).get("terminal_id"),
+                callable(__event_call__),
+                (__metadata__ or {}).get("session_id"),
             )
 
             if logger.isEnabledFor(logging.DEBUG):
@@ -7382,6 +7514,8 @@ class Pipe:
                                         builtin_tools=builtin_tools,
                                         running_tool_tasks=running_tool_tasks,
                                         emit_delta=emit_message_delta,
+                                        event_call=__event_call__,
+                                        metadata=__metadata__,
                                     )
                                 elif is_model_thinking and content_type in (
                                     "thinking",
