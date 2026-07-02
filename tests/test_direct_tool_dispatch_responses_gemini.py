@@ -200,6 +200,59 @@ def test_gemini_direct_tool_without_event_call_reports_clear_error():
     assert "requires __event_call__" in result.output_text
 
 
+def test_gemini_namespaced_call_name_resolves_to_bare_tool():
+    """Gemini/proxies may surface calls as 'default_api:list_files'. The
+    executor must strip the namespace and still find the registered tool."""
+    ToolCall = gemini_mod.ToolCall
+    OpenWebUIToolExecutor = gemini_mod.OpenWebUIToolExecutor
+
+    captured_events: list[dict] = []
+
+    async def fake_event_call(event: dict):
+        captured_events.append(event)
+        return {"entries": ["a.txt"]}
+
+    async def run():
+        executor = OpenWebUIToolExecutor(
+            {"list_files": DIRECT_TOOL_ENTRY},
+            parallel=True,
+            event_call=fake_event_call,
+            metadata={"session_id": "sess-789"},
+        )
+        results = []
+        for name in ("default_api:list_files", "default_api.list_files"):
+            call = ToolCall(call_id="c", name=name, arguments={"directory": "/"})
+            results.extend(await executor.execute([call]))
+        return results
+
+    results = asyncio.run(run())
+    assert len(results) == 2
+    for result in results:
+        assert result.status == "ok", result.output_text
+        assert "not found" not in result.output_text.lower()
+    assert len(captured_events) == 2
+
+
+def test_gemini_namespaced_callable_tool_resolves():
+    ToolCall = gemini_mod.ToolCall
+    OpenWebUIToolExecutor = gemini_mod.OpenWebUIToolExecutor
+
+    async def fake_callable(**kwargs):
+        return {"ok": True, "kwargs": kwargs}
+
+    async def run():
+        executor = OpenWebUIToolExecutor(
+            {"search_memories": {"callable": fake_callable, "spec": {"name": "search_memories"}}},
+            parallel=True,
+        )
+        call = ToolCall(call_id="c", name="default_api:search_memories", arguments={"query": "x"})
+        return await executor.execute([call])
+
+    results = asyncio.run(run())
+    assert results[0].status == "ok"
+    assert "ok" in results[0].output_text
+
+
 def test_gemini_non_direct_tool_still_uses_callable_path():
     ToolCall = gemini_mod.ToolCall
     OpenWebUIToolExecutor = gemini_mod.OpenWebUIToolExecutor

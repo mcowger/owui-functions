@@ -433,10 +433,6 @@ def _guess_mime_type_from_url(url: str) -> str | None:
     return guessed
 
 
-def _part_to_json(part: types.Part) -> dict[str, Any]:
-    return part.model_dump(mode="json", exclude_none=True)
-
-
 def _content_to_json(content: types.Content) -> dict[str, Any]:
     return content.model_dump(mode="json", exclude_none=True)
 
@@ -577,6 +573,24 @@ class ToolResult:
     error_message: str | None = None
 
 
+@dataclass
+class _StreamResult:
+    """Outcome of consuming one streamed Gemini response.
+
+    ``model_contents`` holds each streamed chunk's ``Content`` verbatim (never
+    merged), so ``thought_signature`` stays attached to its originating part.
+    These must be circulated back to the API unchanged, exactly as the SDK's
+    own chat session does in ``record_history``.
+    """
+
+    model_contents: list["types.Content"]
+    tool_calls: list["ToolCall"]
+    visible_blocks: list[str]
+    final_text: str
+    final_text_emitted: bool
+    grounding_response: "types.GenerateContentResponse | None"
+
+
 class OpenWebUIToolRegistry:
     def __init__(self, registry: dict[str, Any] | None):
         self._definitions: dict[str, ToolDefinition] = {}
@@ -704,12 +718,45 @@ class OpenWebUIToolExecutor:
             status="ok",
         )
 
+    def _candidate_names(self, name: str) -> list[str]:
+        """Return possible registry keys for a (possibly namespaced) call name.
+
+        Gemini namespaces function declarations under ``default_api`` and some
+        proxies surface tool calls as ``default_api:list_files`` (or
+        ``default_api.list_files``). Our registry is keyed by the bare tool
+        name, so try the raw name first, then progressively strip a leading
+        ``namespace:`` / ``namespace.`` segment.
+        """
+        candidates = [name]
+        for sep in (":", "."):
+            if sep in name:
+                candidates.append(name.rsplit(sep, 1)[-1])
+        # De-duplicate while preserving order.
+        seen: set[str] = set()
+        return [c for c in candidates if c and not (c in seen or seen.add(c))]
+
+    def _resolve(self, name: str) -> tuple[Any | None, dict[str, Any] | None]:
+        for candidate in self._candidate_names(name):
+            fn = self._callables.get(candidate)
+            if fn is not None:
+                return fn, None
+            entry = self._direct_entries.get(candidate)
+            if entry is not None:
+                return None, entry
+        return None, None
+
     async def _execute_one(self, call: ToolCall) -> ToolResult:
-        fn = self._callables.get(call.name)
+        fn, direct_entry = self._resolve(call.name)
         if fn is None:
-            direct_entry = self._direct_entries.get(call.name)
             if direct_entry is not None:
                 return await self._execute_direct(call, direct_entry)
+            _logger = _get_logger("INFO")
+            _logger.warning(
+                "Tool not found: call.name=%r; callables=%r direct=%r",
+                call.name,
+                sorted(self._callables.keys()),
+                sorted(self._direct_entries.keys()),
+            )
             return ToolResult(
                 call_id=call.call_id,
                 name=call.name,
@@ -1002,55 +1049,6 @@ def _build_generation_config(
     return types.GenerateContentConfig.model_validate(filtered)
 
 
-def _response_content(response: types.GenerateContentResponse) -> types.Content | None:
-    if response.candidates:
-        candidate = response.candidates[0]
-        if candidate and candidate.content:
-            return candidate.content
-    return None
-
-
-def _extract_visible_text(content: types.Content | None) -> str:
-    if not content or not content.parts:
-        return ""
-    parts: list[str] = []
-    for part in content.parts:
-        if part.text and not part.thought:
-            parts.append(part.text)
-    return "".join(parts)
-
-
-def _extract_thought_blocks(content: types.Content | None) -> list[str]:
-    if not content or not content.parts:
-        return []
-    blocks: list[str] = []
-    for part in content.parts:
-        if part.thought and part.text:
-            blocks.append(
-                "<details type=\"reasoning\" done=\"true\">\n"
-                "<summary>Thought</summary>\n"
-                f"{html.escape(part.text)}\n"
-                "</details>\n"
-            )
-    return blocks
-
-
-def _tool_calls_from_response(response: types.GenerateContentResponse) -> list[ToolCall]:
-    calls: list[ToolCall] = []
-    for fn_call in response.function_calls or []:
-        name = fn_call.name or ""
-        if not name:
-            continue
-        calls.append(
-            ToolCall(
-                call_id=fn_call.id or generate_ulid(),
-                name=name,
-                arguments=fn_call.args or {},
-            )
-        )
-    return calls
-
-
 def _tool_response_content(result: ToolResult) -> types.Content:
     part = types.Part.from_function_response(name=result.name, response=result.response_payload)
     return types.Content(role="tool", parts=[part])
@@ -1111,15 +1109,144 @@ class Pipe:
             return await __tools__
         return __tools__ or {}
 
-    async def _single_response(
+    async def _stream_response(
         self,
         *,
         client: Any,
         model_id: str,
         contents: list[types.Content],
         config: types.GenerateContentConfig,
-    ) -> types.GenerateContentResponse:
-        return await client.models.generate_content(model=model_id, contents=contents, config=config)
+        events: "OpenWebUIRuntimeEvents",
+        emit: bool,
+        use_code_execution: bool,
+    ) -> "_StreamResult":
+        """Stream a single Gemini response, emitting parts live in stream order.
+
+        Aggregates all streamed parts into one ``types.Content`` (preserving
+        ``thought_signature`` on each part so context survives tool loops) and
+        returns the reconstructed response for the caller's tool-call handling.
+        """
+
+        model_contents: list[types.Content] = []
+        tool_calls: list[ToolCall] = []
+        visible_blocks: list[str] = []
+        final_text_parts: list[str] = []
+        pending_thoughts: list[str] = []
+        grounding_response: types.GenerateContentResponse | None = None
+        final_text_emitted = False
+
+        async def _flush_thoughts() -> None:
+            if not pending_thoughts:
+                return
+            text = "".join(pending_thoughts).strip()
+            pending_thoughts.clear()
+            if not text:
+                return
+            block = (
+                '<details type="reasoning" done="true">\n'
+                "<summary>Thought</summary>\n"
+                f"{html.escape(text)}\n"
+                "</details>\n"
+            )
+            visible_blocks.append(block)
+            if emit:
+                await events.delta(block)
+
+        stream = await client.models.generate_content_stream(
+            model=model_id, contents=contents, config=config
+        )
+        async for chunk in stream:
+            candidate = chunk.candidates[0] if chunk.candidates else None
+            if candidate is not None and candidate.grounding_metadata is not None:
+                grounding_response = chunk
+            content = candidate.content if candidate else None
+            if not content or not content.parts:
+                continue
+
+            # Keep each chunk's Content verbatim. The SDK never merges streamed
+            # chunks (see chats.record_history); rebuilding a single Content
+            # detaches thought_signature from its function_call part, which the
+            # API rejects on the next turn.
+            model_contents.append(content)
+
+            for part in content.parts:
+                if part.thought and part.text:
+                    pending_thoughts.append(part.text)
+                    continue
+
+                # Any non-thought part ends the current thought section.
+                await _flush_thoughts()
+
+                if getattr(part, "function_call", None) is not None:
+                    fn_call = part.function_call
+                    if fn_call.name:
+                        tool_calls.append(
+                            ToolCall(
+                                call_id=fn_call.id or generate_ulid(),
+                                name=fn_call.name,
+                                arguments=fn_call.args or {},
+                            )
+                        )
+                    continue
+
+                if getattr(part, "tool_call", None) is not None:
+                    block = _format_server_tool_call_detail(part)
+                    if block:
+                        visible_blocks.append(block)
+                        if emit:
+                            await events.delta(block)
+                    continue
+
+                if use_code_execution and getattr(part, "executable_code", None) is not None:
+                    ec = part.executable_code
+                    code = getattr(ec, "code", "") or ""
+                    lang = str(getattr(ec, "language", "") or "python").lower()
+                    block = (
+                        '<details type="tool_calls" done="true" id="" name="code_execution" '
+                        'arguments="" result="" files="" embeds="">\n'
+                        "<summary>Code Executed</summary>\n"
+                        f"```{lang}\n{html.escape(code)}\n```\n"
+                        "</details>\n"
+                    )
+                    visible_blocks.append(block)
+                    if emit:
+                        await events.delta(block)
+                    continue
+
+                if use_code_execution and getattr(part, "code_execution_result", None) is not None:
+                    cr = part.code_execution_result
+                    output = getattr(cr, "output", "") or ""
+                    outcome = str(getattr(cr, "outcome", "") or "")
+                    block = (
+                        '<details type="tool_calls" done="true" id="" name="code_result" '
+                        'arguments="" result="" files="" embeds="">\n'
+                        "<summary>Code Result</summary>\n"
+                        f"```\n{html.escape(output)}\n```\n"
+                        f"{('Outcome: ' + html.escape(outcome)) if outcome else ''}\n"
+                        "</details>\n"
+                    )
+                    visible_blocks.append(block)
+                    if emit:
+                        await events.delta(block)
+                    continue
+
+                if part.text:
+                    final_text_parts.append(part.text)
+                    if emit:
+                        await events.delta(part.text)
+                        final_text_emitted = True
+
+        # Flush any trailing thought text (no visible part followed it).
+        await _flush_thoughts()
+
+        return _StreamResult(
+            model_contents=model_contents,
+            tool_calls=tool_calls,
+            visible_blocks=visible_blocks,
+            final_text="".join(final_text_parts).strip(),
+            final_text_emitted=final_text_emitted,
+            grounding_response=grounding_response,
+        )
 
     async def _run_request(
         self,
@@ -1177,74 +1304,33 @@ class Pipe:
         async with _gemini_client(cfg) as client:
             for loop_index in range(cfg.MAX_FUNCTION_CALL_LOOPS):
                 logger.debug("Gemini request loop=%s model=%s", loop_index + 1, model_id)
-                response = await self._single_response(client=client, model_id=model_id, contents=contents, config=config)
-                model_content = _response_content(response)
+                stream_result = await self._stream_response(
+                    client=client,
+                    model_id=model_id,
+                    contents=contents,
+                    config=config,
+                    events=events,
+                    emit=True,
+                    use_code_execution=use_code_execution,
+                )
+                model_contents = stream_result.model_contents
+                visible_blocks.extend(stream_result.visible_blocks)
 
-                thought_blocks = _extract_thought_blocks(model_content)
-                visible_blocks.extend(thought_blocks)
-                for block in thought_blocks:
-                    await events.delta(block)
+                tool_calls = stream_result.tool_calls if allow_tools else []
 
-                # Render server-side tool invocations (e.g. Search, Maps, URL) as <details> blocks.
-                if has_server_tools and model_content is not None:
-                    for part in (model_content.parts or []):
-                        if getattr(part, "tool_call", None) is not None:
-                            block = _format_server_tool_call_detail(part)
-                            if block:
-                                visible_blocks.append(block)
-                                await events.delta(block)
-
-                # Render code execution results as <details> blocks.
-                if use_code_execution and model_content is not None:
-                    for part in (model_content.parts or []):
-                        ec = getattr(part, "executable_code", None)
-                        cr = getattr(part, "code_execution_result", None)
-                        if ec is not None:
-                            code = getattr(ec, "code", "") or ""
-                            lang = str(getattr(ec, "language", "") or "python").lower()
-                            block = (
-                                '<details type="tool_calls" done="true" id="" name="code_execution" '
-                                'arguments="" result="" files="" embeds="">\n'
-                                "<summary>Code Executed</summary>\n"
-                                f"```{lang}\n{html.escape(code)}\n```\n"
-                                "</details>\n"
-                            )
-                            visible_blocks.append(block)
-                            await events.delta(block)
-                        if cr is not None:
-                            output = getattr(cr, "output", "") or ""
-                            outcome = str(getattr(cr, "outcome", "") or "")
-                            block = (
-                                '<details type="tool_calls" done="true" id="" name="code_result" '
-                                'arguments="" result="" files="" embeds="">\n'
-                                "<summary>Code Result</summary>\n"
-                                f"```\n{html.escape(output)}\n```\n"
-                                f"{('Outcome: ' + html.escape(outcome)) if outcome else ''}\n"
-                                "</details>\n"
-                            )
-                            visible_blocks.append(block)
-                            await events.delta(block)
-
-                tool_calls = _tool_calls_from_response(response) if allow_tools else []
-
-                # Always append model_content to the live contents list.  When Google Search
-                # is active, the response includes toolCall/toolResponse parts that must be
-                # circulated back verbatim (including thought_signatures) for context to be
-                # preserved across iterations.  We use the live SDK object so no serialization
-                # round-trip strips thought_signature.  Do NOT add to persisted_contents for
-                # the same reason — cross-turn history only needs function_response items.
-                if model_content is not None:
-                    contents.append(model_content)
+                # Circulate each streamed chunk's Content back verbatim (including
+                # thought_signatures) so context is preserved across iterations.
+                # The chunks are the live SDK objects — no serialization round-trip
+                # strips thought_signature.  Do NOT add to persisted_contents here
+                # — cross-turn history only needs function_response items.
+                contents.extend(model_contents)
 
                 if not tool_calls:
-                    if model_content is not None:
-                        persisted_contents.append(model_content)
-                    final_text = _extract_visible_text(model_content).strip() or getattr(response, "text", "") or ""
-                    if has_server_tools:
-                        await _emit_grounding_sources(response, events)
-                    if final_text:
-                        await events.delta(final_text)
-                        final_text_emitted = True
+                    persisted_contents.extend(model_contents)
+                    final_text = stream_result.final_text
+                    final_text_emitted = stream_result.final_text_emitted
+                    if has_server_tools and stream_result.grounding_response is not None:
+                        await _emit_grounding_sources(stream_result.grounding_response, events)
                     break
 
                 if tool_calls_executed + len(tool_calls) > cfg.MAX_TOOL_CALLS:
@@ -1272,26 +1358,19 @@ class Pipe:
                     tools=None,
                     server_tools=False,
                 )
-                fallback_response = await self._single_response(
+                fallback_result = await self._stream_response(
                     client=client,
                     model_id=model_id,
                     contents=contents,
                     config=fallback_config,
+                    events=events,
+                    emit=not final_text_emitted,
+                    use_code_execution=False,
                 )
-                fallback_content = _response_content(fallback_response)
-                fallback_thought_blocks = _extract_thought_blocks(fallback_content)
-                visible_blocks.extend(fallback_thought_blocks)
-                for block in fallback_thought_blocks:
-                    await events.delta(block)
-                if fallback_content is not None:
-                    persisted_contents.append(fallback_content)
-                final_text = (
-                    _extract_visible_text(fallback_content).strip()
-                    or getattr(fallback_response, "text", "")
-                    or final_text
-                )
-                if final_text and not final_text_emitted:
-                    await events.delta(final_text)
+                visible_blocks.extend(fallback_result.visible_blocks)
+                persisted_contents.extend(fallback_result.model_contents)
+                final_text = fallback_result.final_text or final_text
+                if fallback_result.final_text_emitted:
                     final_text_emitted = True
 
         blocks_text = "".join(visible_blocks)
@@ -1374,3 +1453,4 @@ class Pipe:
 
 
 __all__ = ["Pipe"]
+
