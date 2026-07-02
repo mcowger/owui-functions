@@ -1357,6 +1357,10 @@ class TurnState:
     pending_ci_code_snippets: dict[int, str] = field(default_factory=dict)
     server_tool_status_keys: set[str] = field(default_factory=set)
     current_output_item_type: str | None = None  # type of the active output item
+    # Items streamed via response.output_item.done during the CURRENT response.
+    # Used to backfill response.output when a proxy returns an empty output
+    # array in the terminal response.completed event (spec violation).
+    current_response_items: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -2874,6 +2878,9 @@ class ResponsesEngine:
             # We need MAX_FUNCTION_CALL_LOOPS tool-call iterations PLUS one final
             # response to get the model's text answer, so range is +1.
             for loop_iteration in range(cfg.MAX_FUNCTION_CALL_LOOPS + 1):
+                self._logger.debug(
+                    "run_streaming_turn: iteration=%s starting stream", loop_iteration
+                )
                 response = await self._stream_single_response(
                     request=request,
                     ctx=ctx,
@@ -2883,11 +2890,28 @@ class ResponsesEngine:
                     api_key=cfg.API_KEY,
                 )
                 if response is None:
+                    self._logger.debug(
+                        "run_streaming_turn: iteration=%s response is None, breaking",
+                        loop_iteration,
+                    )
                     break
                 self._merge_usage(state, response)
 
                 tool_calls = self._extract_tool_calls(response)
+                self._logger.debug(
+                    "run_streaming_turn: iteration=%s extracted %d tool_calls: %s",
+                    loop_iteration,
+                    len(tool_calls),
+                    [f"{c.name}({c.call_id})" for c in tool_calls],
+                )
                 if not tool_calls:
+                    self._logger.debug(
+                        "run_streaming_turn: iteration=%s no tool_calls, "
+                        "visible_text_len=%d internal_text_len=%d, breaking",
+                        loop_iteration,
+                        len(state.assistant_visible_text),
+                        len(state.assistant_internal_text),
+                    )
                     break
 
                 if loop_iteration >= cfg.MAX_FUNCTION_CALL_LOOPS:
@@ -2908,6 +2932,13 @@ class ResponsesEngine:
 
                 tool_results = await tool_executor.execute(tool_calls)
                 state.tool_calls_executed += len(tool_results)
+                self._logger.debug(
+                    "run_streaming_turn: iteration=%s executed %d tool_calls, "
+                    "results statuses=%s",
+                    loop_iteration,
+                    len(tool_results),
+                    [r.status for r in tool_results],
+                )
 
                 # Emit each tool call as a collapsible <details type="tool_calls"> block
                 # so Open WebUI renders the expandable input/output UI.
@@ -2916,6 +2947,13 @@ class ResponsesEngine:
                     state.assistant_visible_text += block
                     # Do not add to internal_text — details blocks must not
                     # appear in history context sent back to the API.
+                    self._logger.debug(
+                        "run_streaming_turn: emitting tool_call delta block "
+                        "(len=%d) for call=%s: %r",
+                        len(block),
+                        call.name,
+                        block[:200],
+                    )
                     await events.delta(block)
 
                 call_items = self._extract_function_call_items(response)
@@ -2949,6 +2987,15 @@ class ResponsesEngine:
             # Store visible_text so blocks persist on page reload, but use
             # internal_text when reconstructing input for future API calls.
             final_text = state.assistant_visible_text or state.assistant_internal_text or state.error_message or ""
+            self._logger.debug(
+                "run_streaming_turn finally: pre-persist final_text_len=%d "
+                "visible_len=%d internal_len=%d error=%r final_text_preview=%r",
+                len(final_text),
+                len(state.assistant_visible_text),
+                len(state.assistant_internal_text),
+                state.error_message,
+                final_text[:300],
+            )
             items_to_persist = [
                 item for item in state.structured_items if _should_persist_item(item, cfg)
             ]
@@ -2986,8 +3033,16 @@ class ResponsesEngine:
                 self._logger.debug("Failed to emit terminal status", exc_info=True)
 
             try:
+                completion_content = state.assistant_visible_text or final_text
+                self._logger.debug(
+                    "run_streaming_turn finally: emitting terminal chat_completion "
+                    "content_len=%d error=%r content_preview=%r",
+                    len(completion_content),
+                    state.error_message,
+                    completion_content[:300],
+                )
                 await events.chat_completion({
-                    "content": state.assistant_visible_text or final_text,
+                    "content": completion_content,
                     "usage": state.usage,
                     "error": state.error_message,
                     "done": True,
@@ -3042,10 +3097,31 @@ class ResponsesEngine:
         api_key: str,
     ) -> dict[str, Any] | None:
         response_payload: dict[str, Any] | None = None
+        # Reset the per-response item collector. Items completed during this
+        # stream are appended here (see _handle_event) so we can repair an
+        # empty response.output on the terminal event.
+        state.current_response_items = []
         async for event in self._client.stream_responses(request, base_url=base_url, api_key=api_key):
             response_payload = await self._handle_event(event, state, events, ctx)
             if isinstance(event, (ResponseFailedEvent, ResponseIncompleteEvent)):
                 break
+        # Defensive backfill: a conformant Responses API returns the complete
+        # list of output items in the terminal response.completed snapshot.
+        # If the upstream proxy returned an empty (or missing) output array but
+        # we observed output_item.done events during the stream, reconstruct
+        # response.output from those items so tool calls are not silently lost.
+        if isinstance(response_payload, dict) and state.current_response_items:
+            existing_output = response_payload.get("output") or []
+            if not existing_output:
+                self._logger.warning(
+                    "_stream_single_response: response.completed returned empty "
+                    "output array; backfilling %d item(s) from streamed "
+                    "output_item.done events (upstream proxy spec violation). "
+                    "item_types=%s",
+                    len(state.current_response_items),
+                    [it.get("type") for it in state.current_response_items],
+                )
+                response_payload["output"] = list(state.current_response_items)
         return response_payload
 
     async def _handle_event(
@@ -3094,6 +3170,13 @@ class ResponsesEngine:
                     state.assistant_visible_text += delta
                     state.assistant_internal_text += delta
                     await events.delta(delta)
+            else:
+                self._logger.debug(
+                    "_handle_event: SUPPRESSED output_text delta because "
+                    "current_output_item_type=%r (delta_preview=%r)",
+                    state.current_output_item_type,
+                    (event.delta or "")[:80],
+                )
             return None
 
         if isinstance(event, ResponseReasoningSummaryTextDoneEvent):
@@ -3149,8 +3232,14 @@ class ResponsesEngine:
                 item_type = str(item.get("type") or "")
                 if isinstance(event, ResponseOutputItemAddedEvent):
                     state.current_output_item_type = item_type
+                    self._logger.debug(
+                        "_handle_event: output item ADDED type=%r", item_type
+                    )
                 elif isinstance(event, ResponseOutputItemDoneEvent):
                     state.current_output_item_type = None
+                    self._logger.debug(
+                        "_handle_event: output item DONE type=%r", item_type
+                    )
                 if item.get("type") == "code_interpreter_call":
                     await handle_code_interpreter_item(
                         item,
@@ -3200,19 +3289,38 @@ class ResponsesEngine:
                             await events.source(payload)
                             await events.citation(payload)
                 if isinstance(event, ResponseOutputItemDoneEvent):
+                    # Track every completed output item for THIS response so we
+                    # can backfill response.output if the terminal
+                    # response.completed event returns an empty output array
+                    # (some proxies drop it — a spec violation).
+                    state.current_response_items.append(item)
                     self._record_structured_item(item, state, ctx.runtime_config)
             return None
 
         if isinstance(event, ResponseCompletedEvent):
             state.response_text = json.dumps(event.response)
+            output_types = [
+                (it or {}).get("type")
+                for it in ((event.response or {}).get("output") or [])
+            ]
+            self._logger.debug(
+                "_handle_event: ResponseCompletedEvent output_item_types=%s",
+                output_types,
+            )
             return event.response
 
         if isinstance(event, ResponseIncompleteEvent):
             state.error_message = event.error_message or "Response incomplete"
+            self._logger.debug(
+                "_handle_event: ResponseIncompleteEvent error=%r", state.error_message
+            )
             return event.response or {}
 
         if isinstance(event, ResponseFailedEvent):
             state.error_message = event.error_message or "Response failed"
+            self._logger.debug(
+                "_handle_event: ResponseFailedEvent error=%r", state.error_message
+            )
             return event.response or {}
 
         return None
@@ -3542,10 +3650,25 @@ class OpenWebUIRuntimeEvents(RuntimeEvents):
 
     def __init__(self, emitter: Any):
         self._emitter = emitter
+        self._logger = get_logger(__name__)
 
     async def _emit(self, payload: dict[str, Any]) -> None:
         if not self._emitter:
+            self._logger.debug(
+                "OpenWebUIRuntimeEvents._emit: NO emitter available, dropping "
+                "payload type=%s",
+                (payload or {}).get("type"),
+            )
             return
+        ptype = (payload or {}).get("type")
+        pdata = (payload or {}).get("data") or {}
+        content = pdata.get("content")
+        self._logger.debug(
+            "OpenWebUIRuntimeEvents._emit: type=%s done=%s content_len=%s",
+            ptype,
+            pdata.get("done"),
+            len(content) if isinstance(content, str) else None,
+        )
         if inspect.iscoroutinefunction(self._emitter):
             await self._emitter(payload)
             return
