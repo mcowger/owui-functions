@@ -1186,9 +1186,9 @@ class Pipe:
                 __tools__ = await __tools__
             tools = __tools__ or {}
 
-            memory_enabled = bool(
-                (__user__ or {}).get("settings", {}).get("ui", {}).get("memory", False)
-            )
+            user_settings = (__user__ or {}).get("settings") or {}
+            user_ui_settings = user_settings.get("ui") or {}
+            memory_enabled = bool(user_ui_settings.get("memory", False))
 
             payload, client_tool_names = self._build_payload(
                 body=body,
