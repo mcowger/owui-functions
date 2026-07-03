@@ -68,11 +68,11 @@ class _StubClient:
     def __init__(self, events):
         self._events = events
 
-    async def stream_responses(self, request, *, base_url, api_key):
+    async def stream_responses(self, request, *, base_url, api_key, max_retries=3):
         for ev in self._events:
             yield ev
 
-    async def create_response(self, request, *, base_url, api_key):
+    async def create_response(self, request, *, base_url, api_key, max_retries=3):
         return {}
 
     async def close(self):
@@ -168,13 +168,13 @@ def test_backfills_output_and_executes_tool_when_completed_output_empty():
         def __init__(self):
             self._calls = 0
 
-        async def stream_responses(self, request, *, base_url, api_key):
+        async def stream_responses(self, request, *, base_url, api_key, max_retries=3):
             self._calls += 1
             evs = _make_buggy_events() if self._calls == 1 else second_events
             for ev in evs:
                 yield ev
 
-        async def create_response(self, request, *, base_url, api_key):
+        async def create_response(self, request, *, base_url, api_key, max_retries=3):
             return {}
 
     engine = ResponsesEngine(_TwoStreamClient(), HistoryManager(_NoStore()))

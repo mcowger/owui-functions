@@ -120,6 +120,12 @@ class PipeValves(BaseModel):
         default=None,
         description="Optional default response_mime_type for Gemini output.",
     )
+    MAX_RETRIES: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description="Max retries for transient upstream errors (e.g. 502/503) and connection failures.",
+    )
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default=_DEFAULT_LOG_LEVEL,
         description="Logging level.",
@@ -1072,8 +1078,7 @@ def _build_http_options(cfg: RuntimeConfig) -> types.HttpOptions | None:
         payload["base_url"] = cfg.BASE_URL.rstrip("/")
     if cfg.API_VERSION:
         payload["api_version"] = cfg.API_VERSION
-    if not payload:
-        return None
+    payload["retry_options"] = types.HttpRetryOptions(attempts=cfg.MAX_RETRIES + 1)
     return types.HttpOptions.model_validate(payload)
 
 

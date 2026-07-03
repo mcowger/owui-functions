@@ -194,6 +194,12 @@ class PipeValves(BaseModel):
         default="id",
         description="Controls which user identifier is sent in the 'user' parameter to OpenAI.",
     )
+    MAX_RETRIES: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description="Max retries for transient upstream errors (e.g. 502/503) and connection failures.",
+    )
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default=DEFAULT_PIPE_LOG_LEVEL,
         description="Select logging level. Recommend INFO or WARNING for production use.",
@@ -736,14 +742,16 @@ class OpenAIClient:
     """
 
     def __init__(self) -> None:
-        self._clients: dict[tuple[str, str], AsyncOpenAI] = {}
+        self._clients: dict[tuple[str, str, int], AsyncOpenAI] = {}
 
-    def _get_client(self, *, base_url: str, api_key: str) -> AsyncOpenAI:
+    def _get_client(self, *, base_url: str, api_key: str, max_retries: int) -> AsyncOpenAI:
         normalized_base_url = base_url.rstrip("/")
-        cache_key = (normalized_base_url, api_key)
+        cache_key = (normalized_base_url, api_key, max_retries)
         client = self._clients.get(cache_key)
         if client is None:
-            client = AsyncOpenAI(api_key=api_key, base_url=normalized_base_url)
+            client = AsyncOpenAI(
+                api_key=api_key, base_url=normalized_base_url, max_retries=max_retries
+            )
             self._clients[cache_key] = client
         return client
 
@@ -758,8 +766,9 @@ class OpenAIClient:
         *,
         base_url: str,
         api_key: str,
+        max_retries: int = 3,
     ) -> AsyncIterator[dict[str, Any]]:
-        client = self._get_client(base_url=base_url, api_key=api_key)
+        client = self._get_client(base_url=base_url, api_key=api_key, max_retries=max_retries)
         payload = prepare_payload(request)
         payload["stream"] = True
         stream = await client.responses.create(**payload)
@@ -772,8 +781,9 @@ class OpenAIClient:
         *,
         base_url: str,
         api_key: str,
+        max_retries: int = 3,
     ) -> dict[str, Any]:
-        client = self._get_client(base_url=base_url, api_key=api_key)
+        client = self._get_client(base_url=base_url, api_key=api_key, max_retries=max_retries)
         payload = prepare_payload(request)
         response = await client.responses.create(**payload)
         return event_to_dict(response)
@@ -2354,6 +2364,7 @@ class ResponsesEngine:
             request,
             base_url=ctx.runtime_config.BASE_URL,
             api_key=ctx.runtime_config.API_KEY,
+            max_retries=ctx.runtime_config.MAX_RETRIES,
         )
         try:
             outputs = response.get("output") or []
@@ -2390,7 +2401,9 @@ class ResponsesEngine:
         # stream are appended here (see _handle_event) so we can repair an
         # empty response.output on the terminal event.
         state.current_response_items = []
-        async for event in self._client.stream_responses(request, base_url=base_url, api_key=api_key):
+        async for event in self._client.stream_responses(
+            request, base_url=base_url, api_key=api_key, max_retries=ctx.runtime_config.MAX_RETRIES
+        ):
             response_payload = await self._handle_event(event, state, events, ctx)
             if event.get("type") in {"response.failed", "response.incomplete"}:
                 break

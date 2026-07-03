@@ -330,6 +330,7 @@ class Pipe:
         return AsyncAnthropic(
             api_key=api_key,
             timeout=self.valves.REQUEST_TIMEOUT,
+            max_retries=self.valves.MAX_RETRIES,
             **({"base_url": base_url} if base_url else {}),
         )
 
