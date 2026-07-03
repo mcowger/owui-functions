@@ -32,6 +32,7 @@ import inspect
 import json
 import logging
 import re
+import secrets
 import time
 import traceback
 import uuid
@@ -108,6 +109,70 @@ PATTERN_REASONING_BLOCK = re.compile(
     r'\n?<details type="reasoning"[^>]*>.*?</details>\n?',
     flags=re.DOTALL,
 )
+
+# ---------------------------------------------------------------------------
+# Side-table storage for full-size tool call/result payloads.
+#
+# Rendered <details type="tool_calls"> blocks in message text carry only a
+# possibly-truncated preview plus a "ref" attribute pointing at a ULID; the
+# full-fidelity tool_use/tool_result blocks live in
+# chat.chat["anthropic_pipe"]["items"][ulid], written/read via the Chats
+# model. This keeps large tool outputs from being re-embedded (and resent to
+# the API) in full on every subsequent turn.
+# ---------------------------------------------------------------------------
+ULID_LENGTH = 16
+CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def generate_ulid() -> str:
+    return "".join(secrets.choice(CROCKFORD_ALPHABET) for _ in range(ULID_LENGTH))
+
+
+class ToolResultStore:
+    """Persists full-fidelity tool call/result payloads under
+    ``chat.chat["anthropic_pipe"]["items"]``, keyed by ULID, via Open WebUI's
+    ``Chats`` model. The live ``Chats.get_chat_by_id``/``update_chat_by_id``
+    are async (see open_webui/models/chats.py), so this store is async too.
+    """
+
+    ROOT_KEY = "anthropic_pipe"
+    VERSION = 1
+
+    def __init__(self, chats_model: Any = None):
+        self._Chats = chats_model if chats_model is not None else Chats
+
+    async def save(self, chat_id: Optional[str], ulid: str, payload: dict) -> bool:
+        if not self._Chats or not chat_id:
+            return False
+        try:
+            chat = await self._Chats.get_chat_by_id(chat_id)
+            if not chat:
+                return False
+            root = chat.chat.setdefault(self.ROOT_KEY, {"__v": self.VERSION})
+            items = root.setdefault("items", {})
+            items[ulid] = {"created_at": int(time.time()), "payload": payload}
+            await self._Chats.update_chat_by_id(chat_id, chat.chat)
+            return True
+        except Exception as exc:
+            logger.warning("ToolResultStore.save failed: %s", exc)
+            return False
+
+    async def load(self, chat_id: Optional[str], ulid: str) -> Optional[dict]:
+        if not self._Chats or not chat_id or not ulid:
+            return None
+        try:
+            chat = await self._Chats.get_chat_by_id(chat_id)
+            if not chat:
+                return None
+            items = chat.chat.get(self.ROOT_KEY, {}).get("items", {})
+            item = items.get(ulid)
+            if not isinstance(item, dict):
+                return None
+            payload = item.get("payload")
+            return payload if isinstance(payload, dict) else None
+        except Exception as exc:
+            logger.warning("ToolResultStore.load failed: %s", exc)
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +251,26 @@ class Pipe:
             le=9999,
             description="Timeout in seconds for individual tool execution.",
         )
+        MAX_TOOL_RESULT_CHARS: int = Field(
+            default=4000,
+            ge=200,
+            le=1000000,
+            description=(
+                "Maximum characters of a tool result shown in the rendered "
+                "<details> block and sent back to the model on this turn. "
+                "The full result is still persisted to the side-table (see "
+                "PERSIST_TOOL_RESULTS) and used when reconstructing history."
+            ),
+        )
+        PERSIST_TOOL_RESULTS: bool = Field(
+            default=True,
+            description=(
+                "Persist full tool call results to a side-table (chat.chat) "
+                "instead of re-embedding them in full on every subsequent "
+                "turn. When disabled, only the truncated preview is kept "
+                "and replayed."
+            ),
+        )
         WEB_SEARCH_USER_CITY: str = Field(
             default="", description="Web search: user city."
         )
@@ -245,6 +330,7 @@ class Pipe:
         self.type = "manifold"
         self.id = "anthropic"
         self.valves = self.Valves()
+        self.tool_result_store = ToolResultStore()
 
     # -----------------------------------------------------------------
     # Model listing (dynamic API fetch + 24h capability cache).
@@ -364,8 +450,8 @@ class Pipe:
     # -----------------------------------------------------------------
     # Message conversion (Open WebUI -> Anthropic).
     # -----------------------------------------------------------------
-    def _convert_messages(
-        self, raw_messages: list, memory_enabled: bool
+    async def _convert_messages(
+        self, raw_messages: list, memory_enabled: bool, chat_id: Optional[str] = None
     ) -> tuple[list[dict], list[dict]]:
         """Return (system_blocks, messages) in Anthropic format."""
         system_blocks: list[dict] = []
@@ -417,7 +503,7 @@ class Pipe:
                 and isinstance(raw_content, str)
                 and '<details type="tool_calls"' in raw_content
             ):
-                parsed = self._parse_assistant_tool_calls(raw_content)
+                parsed = await self._parse_assistant_tool_calls(raw_content, chat_id)
                 if parsed:
                     messages.extend(parsed)
                     continue
@@ -541,7 +627,9 @@ class Pipe:
             return {"type": "image", "source": {"type": "url", "url": image_url}}
         return {"type": "text", "text": f"[Invalid image URL: {image_url}]"}
 
-    def _parse_assistant_tool_calls(self, content: str) -> list[dict]:
+    async def _parse_assistant_tool_calls(
+        self, content: str, chat_id: Optional[str] = None
+    ) -> list[dict]:
         """Reconstruct tool_use/tool_result exchange from rendered details blocks."""
         segments: list[tuple[str, str]] = []
         last_end = 0
@@ -582,6 +670,7 @@ class Pipe:
                 continue
             args_raw = html.unescape(attrs.get("arguments", "") or "")
             result_raw = html.unescape(attrs.get("result", "") or "")
+            ref = html.unescape(attrs.get("ref", "") or "")
             done = (attrs.get("done", "true") or "true") == "true"
             is_error = (attrs.get("error", "false") or "false") == "true"
             try:
@@ -595,10 +684,18 @@ class Pipe:
                 {"type": "tool_use", "id": tc_id, "name": tc_name, "input": tc_input}
             )
             if done:
+                result_content = result_raw or "(no result)"
+                if ref and self.valves.PERSIST_TOOL_RESULTS and chat_id:
+                    stored = await self.tool_result_store.load(chat_id, ref)
+                    if stored is not None and "output" in stored:
+                        output = stored["output"]
+                        result_content = (
+                            output if isinstance(output, str) else str(output)
+                        )
                 result_block: dict = {
                     "type": "tool_result",
                     "tool_use_id": tc_id,
-                    "content": result_raw or "(no result)",
+                    "content": result_content,
                 }
                 if is_error:
                     result_block["is_error"] = True
@@ -831,20 +928,21 @@ class Pipe:
     # -----------------------------------------------------------------
     # Payload assembly.
     # -----------------------------------------------------------------
-    def _build_payload(
+    async def _build_payload(
         self,
         *,
         body: dict,
         user_valves: "Pipe.UserValves",
         tools: Optional[dict],
         memory_enabled: bool,
+        chat_id: Optional[str] = None,
     ) -> tuple[dict, set[str]]:
         model_name = body["model"].split("/")[-1]
         info = self._model_info(model_name)
         max_tokens = min(body.get("max_tokens", info["max_tokens"]), info["max_tokens"])
 
-        system_blocks, messages = self._convert_messages(
-            body.get("messages", []) or [], memory_enabled
+        system_blocks, messages = await self._convert_messages(
+            body.get("messages", []) or [], memory_enabled, chat_id
         )
 
         # NOTE: client.messages.stream() is implicitly streaming and rejects a
@@ -927,15 +1025,27 @@ class Pipe:
 
     @staticmethod
     def _format_tool_result_block(
-        tool_id: str, name: str, args: dict, output: str, is_error: bool = False
+        tool_id: str,
+        name: str,
+        args: dict,
+        output: str,
+        is_error: bool = False,
+        max_chars: int = 4000,
+        ref: str = "",
     ) -> str:
+        raw_result = output if isinstance(output, str) else str(output)
+        truncated = len(raw_result) > max_chars
+        preview = raw_result[:max_chars] if truncated else raw_result
+        if truncated:
+            preview += f"\n… (truncated, {len(raw_result) - max_chars} more chars)"
         escaped_args = html.escape(json.dumps(args, ensure_ascii=False)) if args else ""
-        escaped_result = html.escape(output if isinstance(output, str) else str(output))
+        escaped_result = html.escape(preview)
         error_attr = ' error="true"' if is_error else ""
+        ref_attr = f' ref="{html.escape(ref)}"' if ref else ""
         return (
             f'<details type="tool_calls" done="true" id="{html.escape(tool_id)}" '
             f'name="{html.escape(name)}" arguments="{escaped_args}" '
-            f'result="{escaped_result}" files="" embeds=""{error_attr}>\n'
+            f'result="{escaped_result}" files="" embeds=""{error_attr}{ref_attr}>\n'
             "<summary>Tool Executed</summary>\n"
             "</details>\n"
         )
@@ -1268,11 +1378,12 @@ class Pipe:
             user_ui_settings = user_settings.get("ui") or {}
             memory_enabled = bool(user_ui_settings.get("memory", False))
 
-            payload, client_tool_names = self._build_payload(
+            payload, client_tool_names = await self._build_payload(
                 body=body,
                 user_valves=user_valves,
                 tools=tools,
                 memory_enabled=memory_enabled,
+                chat_id=metadata.get("chat_id"),
             )
 
             result = await self._run_streaming_turn(
@@ -1409,13 +1520,36 @@ class Pipe:
             )
             tool_calls_executed += len(results)
 
+            chat_id = metadata.get("chat_id")
             result_blocks: list[dict] = []
             for call, (block, output, files, embeds, is_error) in zip(
                 tool_calls, results
             ):
                 result_blocks.append(block)
+                ref = ""
+                if self.valves.PERSIST_TOOL_RESULTS and chat_id:
+                    ulid = generate_ulid()
+                    saved = await self.tool_result_store.save(
+                        chat_id,
+                        ulid,
+                        {
+                            "id": call["id"],
+                            "name": call["name"],
+                            "input": call["input"],
+                            "output": output,
+                            "is_error": is_error,
+                        },
+                    )
+                    if saved:
+                        ref = ulid
                 rendered = self._format_tool_result_block(
-                    call["id"], call["name"], call["input"], output, is_error
+                    call["id"],
+                    call["name"],
+                    call["input"],
+                    output,
+                    is_error,
+                    max_chars=self.valves.MAX_TOOL_RESULT_CHARS,
+                    ref=ref,
                 )
                 await emit_block(rendered)
                 if files:
