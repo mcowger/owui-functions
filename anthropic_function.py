@@ -919,10 +919,7 @@ class Pipe:
         tool_id: str, name: str, args: dict, output: str, is_error: bool = False
     ) -> str:
         escaped_args = html.escape(json.dumps(args, ensure_ascii=False)) if args else ""
-        try:
-            escaped_result = html.escape(json.dumps(output, ensure_ascii=False))
-        except Exception:
-            escaped_result = html.escape(json.dumps(str(output), ensure_ascii=False))
+        escaped_result = html.escape(output if isinstance(output, str) else str(output))
         error_attr = ' error="true"' if is_error else ""
         return (
             f'<details type="tool_calls" done="true" id="{html.escape(tool_id)}" '
