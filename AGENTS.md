@@ -1,18 +1,7 @@
 # Agents Guide
 
-## Project Overview
-
-`responses.py` is a single-file Open WebUI pipe function (manifold) that proxies requests
-through the OpenAI Responses API. It is bundled from multiple source modules at build time.
-
 ## Deploying to Open WebUI
 
-### One-time setup
-
-```bash
-cp .env.example .env
-# Edit .env and fill in OWUI_URL and OWUI_API_KEY
-```
 
 ### Upload / update
 
@@ -42,22 +31,15 @@ uv run python upload.py anthropic --create
 ## Reviewing a conversation for errors
 
 Use the Open WebUI API to fetch a chat by ID and inspect its message history,
-status history, and error logs.
+status history, and error logs.  You'll need to execute using 'mise exec -- <command>' to get the appropriate environment variables.
 
 ```bash
 CHAT_ID=282df76e-c702-4768-9351-b7ae11b219be
 
-curl -s "https://owui.home.cowger.us/api/v1/chats/$CHAT_ID" \
+mise exec -- curl -s "https://owui.home.cowger.us/api/v1/chats/$CHAT_ID" \
   -H "Authorization: Bearer $OWUI_API_KEY" | python3 -m json.tool
 ```
 
-Or source the `.env` file first:
-
-```bash
-source .env
-curl -s "$OWUI_URL/api/v1/chats/$CHAT_ID" \
-  -H "Authorization: Bearer $OWUI_API_KEY" | python3 -m json.tool
-```
 
 Key fields to look at in the response:
 
@@ -170,3 +152,4 @@ What this caught for `gemini.py`:
 | `OWUI_API_KEY` | Admin API key (`sk-...`)             |
 
 `.env` is gitignored. Never commit credentials.
+
