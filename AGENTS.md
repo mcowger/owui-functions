@@ -33,11 +33,19 @@ uv run python upload.py anthropic --create
 Use the Open WebUI API to fetch a chat by ID and inspect its message history,
 status history, and error logs.  You'll need to execute using 'mise exec -- <command>' to get the appropriate environment variables.
 
+Always retrieve chats in two separate steps — download to a file first, then
+analyze that file. Never pipe the response directly into `python`/`json.tool`;
+it's inefficient and discards the raw data.
+
 ```bash
 CHAT_ID=282df76e-c702-4768-9351-b7ae11b219be
 
+# 1. Download to a file
 mise exec -- curl -s "https://owui.home.cowger.us/api/v1/chats/$CHAT_ID" \
-  -H "Authorization: Bearer $OWUI_API_KEY" | python3 -m json.tool
+  -H "Authorization: Bearer $OWUI_API_KEY" -o /tmp/chat_$CHAT_ID.json
+
+# 2. Analyze the file
+python3 -m json.tool /tmp/chat_$CHAT_ID.json
 ```
 
 
