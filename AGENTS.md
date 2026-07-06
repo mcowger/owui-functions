@@ -9,6 +9,7 @@
 uv run python upload.py            # responses (default)
 uv run python upload.py gemini     # gemini.py
 uv run python upload.py anthropic  # anthropic_function.py
+uv run python upload.py context    # context.py
 ```
 
 The target may be a bare name (`gemini`), a filename (`gemini.py`), or a
@@ -24,7 +25,7 @@ uv run python upload.py anthropic --create
 
 ## Development workflow
 
-1. Edit the pipe file (`responses.py`, `gemini.py`, or `anthropic_function.py`)
+1. Edit the pipe file (`responses.py`, `gemini.py`, `anthropic_function.py`, or `context.py`)
 2. Commit your changes
 3. Run `uv run python upload.py <target>` to deploy
 
@@ -160,4 +161,3 @@ What this caught for `gemini.py`:
 | `OWUI_API_KEY` | Admin API key (`sk-...`)             |
 
 `.env` is gitignored. Never commit credentials.
-

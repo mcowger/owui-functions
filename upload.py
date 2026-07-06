@@ -51,6 +51,13 @@ DEFAULTS = {
         "name": "Anthropic API Manifold",
         "description": "Anthropic API Manifold",
     },
+    "context.py": {
+        "id": "context_window_manager_simplified",
+        "name": "🚀 Context Window Manager (Simplified)",
+        "description": "Keeps conversations inside the model's context window by anchoring the "
+        "earliest and most recent messages verbatim and persistently, incrementally "
+        "summarizing the middle.",
+    },
 }
 
 # Friendly shorthands -> actual filenames (bare names get ".py" appended
