@@ -1696,16 +1696,58 @@ _OPENAI_STRICT_INCOMPATIBLE_KEYS: frozenset[str] = frozenset({
     "prefixItems",
 })
 
+_JSON_SCHEMA_SHAPE_KEYS: frozenset[str] = frozenset({
+    "$ref",
+    "allOf",
+    "anyOf",
+    "const",
+    "enum",
+    "items",
+    "oneOf",
+    "properties",
+    "type",
+})
+
 
 def _schema_is_strict_compatible(schema: object) -> bool:
     """Return False if the schema contains any keyword banned in strict mode."""
 
+    def check_schema(value: object) -> bool:
+        if isinstance(value, dict):
+            if _OPENAI_STRICT_INCOMPATIBLE_KEYS.intersection(value):
+                return False
+            if not _JSON_SCHEMA_SHAPE_KEYS.intersection(value):
+                return False
+
+            if value.get("additionalProperties") not in (None, False):
+                return False
+
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                if not all(check_schema(prop) for prop in properties.values()):
+                    return False
+
+            items = value.get("items")
+            if isinstance(items, dict) and not check_schema(items):
+                return False
+            if isinstance(items, list) and not all(check_schema(item) for item in items):
+                return False
+
+            for combiner in ("anyOf", "oneOf", "allOf"):
+                variants = value.get(combiner)
+                if isinstance(variants, list) and not all(check_schema(v) for v in variants):
+                    return False
+
+            return True
+
+        if isinstance(value, list):
+            return all(check_schema(item) for item in value)
+        return True
+
     if isinstance(schema, dict):
-        if _OPENAI_STRICT_INCOMPATIBLE_KEYS.intersection(schema):
-            return False
-        return all(_schema_is_strict_compatible(v) for v in schema.values())
+        return check_schema(schema)
     if isinstance(schema, list):
-        return all(_schema_is_strict_compatible(item) for item in schema)
+        return all(check_schema(item) for item in schema)
     return True
 
 

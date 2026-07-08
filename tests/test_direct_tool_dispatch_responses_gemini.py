@@ -60,6 +60,73 @@ DIRECT_TOOL_ENTRY = {
 
 # --- responses.py -----------------------------------------------------------
 
+def test_responses_direct_tool_with_typeless_params_is_not_strictified():
+    """Open Terminal exposes some optional parameters as description-only
+    schema fragments. Responses strict mode must not wrap those into invalid
+    strict anyOf branches."""
+    cfg = responses_mod.PipeValves()
+    registry = responses_mod.OpenWebUIToolRegistry(
+        {
+            "run_command": {
+                "spec": {
+                    "name": "run_command",
+                    "description": "Run a shell command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "wait": {
+                                "description": (
+                                    "Seconds to wait before returning. Null to return immediately."
+                                )
+                            },
+                        },
+                        "required": ["command"],
+                    },
+                },
+                "direct": True,
+                "server": {"url": "http://192.168.0.2:8889"},
+            }
+        }
+    )
+
+    tools = responses_mod.ToolPolicy.build_responses_tools(
+        model_id="gpt-5.1",
+        cfg=cfg,
+        registry=registry,
+        body_tools=[],
+        extra_tools=[],
+        mcp_tools=[],
+        web_search_tools=[],
+    )
+
+    run_command = next(tool for tool in tools if tool["name"] == "run_command")
+    assert run_command["strict"] is False
+    assert run_command["parameters"]["properties"]["wait"] == {
+        "description": "Seconds to wait before returning. Null to return immediately."
+    }
+
+
+def test_responses_typed_direct_tool_can_still_use_strict_mode():
+    cfg = responses_mod.PipeValves()
+    registry = responses_mod.OpenWebUIToolRegistry({"list_files": DIRECT_TOOL_ENTRY})
+
+    tools = responses_mod.ToolPolicy.build_responses_tools(
+        model_id="gpt-5.1",
+        cfg=cfg,
+        registry=registry,
+        body_tools=[],
+        extra_tools=[],
+        mcp_tools=[],
+        web_search_tools=[],
+    )
+
+    list_files = next(tool for tool in tools if tool["name"] == "list_files")
+    assert list_files["strict"] is True
+    assert list_files["parameters"]["required"] == ["directory"]
+    assert list_files["parameters"]["additionalProperties"] is False
+
+
 def test_responses_direct_tool_dispatches_via_event_call():
     ToolCall = responses_mod.ToolCall
     OpenWebUIToolExecutor = responses_mod.OpenWebUIToolExecutor
