@@ -103,6 +103,7 @@ class _CollectingEvents(responses_mod.RuntimeEvents):
     def __init__(self):
         self.deltas = []
         self.completions = []
+        self.citations = []
 
     async def status(self, description, *, done=False, **extra):
         pass
@@ -114,7 +115,7 @@ class _CollectingEvents(responses_mod.RuntimeEvents):
         pass
 
     async def citation(self, data):
-        pass
+        self.citations.append(data)
 
     async def source(self, data):
         pass
@@ -133,6 +134,20 @@ def _build_ctx(cfg):
         model_id="gpt-5.1",
         metadata={"chat_id": None, "message_id": "m1", "owui_model_id": None},
     )
+
+
+def _make_engine():
+    ResponsesEngine = responses_mod.ResponsesEngine
+    HistoryManager = responses_mod.HistoryManager
+
+    class _NoStore:
+        def load_items(self, **kw):
+            return {}
+
+        def save_items(self, **kw):
+            return []
+
+    return ResponsesEngine(_StubClient([]), HistoryManager(_NoStore()))
 
 
 def test_backfills_output_and_executes_tool_when_completed_output_empty():
@@ -206,6 +221,50 @@ def test_backfills_output_and_executes_tool_when_completed_output_empty():
 
     # Final text answer should have streamed through.
     assert "done" in (result.text or "")
+
+
+def test_successful_turn_logs_are_not_emitted_as_visible_citations():
+    session_id = "success-log-session"
+    responses_mod.clear_session_logs(session_id)
+    responses_mod.SESSION_LOGS[session_id].append("raw debug detail")
+
+    cfg = responses_mod.PipeValves()
+    ctx = responses_mod.TurnContext(
+        runtime_config=cfg,
+        model_id="gpt-5.1",
+        metadata={"session_id": session_id},
+    )
+    state = responses_mod.TurnState(error_message=None)
+    events = _CollectingEvents()
+
+    asyncio.run(_make_engine()._emit_log_citation(ctx, state, events))
+
+    assert events.citations == []
+    assert state.citations == []
+    assert responses_mod.get_session_logs(session_id) == []
+
+
+def test_error_turn_logs_are_emitted_as_error_logs_citation():
+    session_id = "error-log-session"
+    responses_mod.clear_session_logs(session_id)
+    responses_mod.SESSION_LOGS[session_id].append("error debug detail")
+
+    cfg = responses_mod.PipeValves()
+    ctx = responses_mod.TurnContext(
+        runtime_config=cfg,
+        model_id="gpt-5.1",
+        metadata={"session_id": session_id},
+    )
+    state = responses_mod.TurnState(error_message="boom")
+    events = _CollectingEvents()
+
+    asyncio.run(_make_engine()._emit_log_citation(ctx, state, events))
+
+    assert len(events.citations) == 1
+    assert events.citations[0]["source"]["name"] == "Error Logs"
+    assert "error debug detail" in events.citations[0]["document"][0]
+    assert len(state.citations) == 1
+    assert responses_mod.get_session_logs(session_id) == []
 
 
 if __name__ == "__main__":

@@ -3221,8 +3221,10 @@ class ResponsesEngine:
         logs = consume_session_logs(session_id)
         if not logs:
             return
+        if not state.error_message:
+            return
 
-        source_name = "Error Logs" if state.error_message else "Logs"
+        source_name = "Error Logs"
         log_text = "\n".join(logs)
         max_len = 4000
         truncated = len(log_text) > max_len
