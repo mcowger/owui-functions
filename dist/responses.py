@@ -2871,7 +2871,11 @@ class ResponsesEngine:
                 self._logger.debug("Failed to emit terminal status", exc_info=True)
 
             try:
-                completion_content = state.assistant_visible_text or final_text
+                # `final_text` is the post-persistence version of the assistant
+                # content. The mutable visible buffer may still contain marker
+                # placeholders added while recording structured items, especially
+                # when a turn is cancelled after tool execution.
+                completion_content = final_text
                 self._logger.debug(
                     "run_streaming_turn finally: emitting terminal chat_completion "
                     "content_len=%d error=%r content_preview=%r",

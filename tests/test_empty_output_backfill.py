@@ -222,6 +222,12 @@ def test_backfills_output_and_executes_tool_when_completed_output_empty():
     # Final text answer should have streamed through.
     assert "done" in (result.text or "")
 
+    # The terminal chat_completion event must not overwrite the message with
+    # the raw visible buffer, which still contains internal placeholders until
+    # persistence has cleaned them up.
+    assert events.completions
+    assert responses_mod.MARKER_PLACEHOLDER not in events.completions[-1]["content"]
+
 
 def test_completed_event_terminates_stream_without_waiting_for_eof():
     """Some upstream proxies deliver response.completed but leave the stream
