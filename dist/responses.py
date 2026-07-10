@@ -496,10 +496,6 @@ class PipeValves(BaseModel):
             "for globally enabling tools across all chats."
         ),
     )
-    TRUNCATION: Literal["auto", "disabled"] = Field(
-        default="auto",
-        description="OpenAI truncation strategy. 'auto' drops middle context items if the conversation exceeds the context window; 'disabled' returns a 400 error instead.",
-    )
     PROMPT_CACHE_KEY: Literal["id", "email"] = Field(
         default="id",
         description="Controls which user identifier is sent in the 'user' parameter to OpenAI.",
@@ -3785,12 +3781,10 @@ def map_completions_to_responses(
         "stream": True,
         "store": True,
         "top_logprobs": body.get("top_logprobs"),
-        "truncation": body.get("truncation"),
         "max_output_tokens": body.get("max_tokens"),
         "reasoning": {"effort": body.get("reasoning_effort")}
         if body.get("reasoning_effort")
         else None,
-        "user": ctx.metadata.get("user_id") or ctx.metadata.get("user_email"),
     }
 
     base_tools = body.get("tools") or []
@@ -3963,7 +3957,6 @@ class Pipe:
             request["tools"] = tools_for_responses
 
     def _apply_request_config(self, request: dict[str, Any], cfg: RuntimeConfig, ctx: TurnContext) -> None:
-        request["truncation"] = cfg.TRUNCATION
         request["prompt_cache_key"] = self._prompt_cache_key(cfg, ctx)
         request["parallel_tool_calls"] = cfg.PARALLEL_TOOL_CALLS
 
