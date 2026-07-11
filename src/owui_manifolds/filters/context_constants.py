@@ -8,7 +8,7 @@ MESSAGE_OVERHEAD_TOKENS = 20
 # summarization model in one call, so an extremely long conversation can't blow
 # out the summarizer's own context window. If exceeded, only the most recent
 # portion (still ordered oldest->newest) of the excluded messages is sent.
-SUMMARY_INPUT_TOKEN_CAP = 60000
+SUMMARY_INPUT_TOKEN_CAP = 250000
 
 # Key under chat.meta where persisted anchor/block-summary state is stored.
 CONTEXT_MANAGER_META_KEY = "context_manager"

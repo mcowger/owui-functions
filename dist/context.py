@@ -1,14 +1,14 @@
 """
 title: 🚀 Context Window Manager (Simplified)
 id: context_window_manager_simplified
-version: 3.0.0
+version: 3.2.0
 license: MIT
-required_open_webui_version: 0.5.17
-description: Keeps conversations inside the model's context window by anchoring the
-    earliest and most recent messages verbatim, and persistently, incrementally
-    summarizing whatever falls in between instead of silently dropping it. Simplified
-    rewrite of the original Advanced Context Manager (JiangNanGenius) - no auto memory,
-    RAG/embeddings, keyword generation, or multimodal processing.
+required_open_webui_version: 0.10.2
+requirements: openai~=2.41, tiktoken>=0.7, pydantic~=2.13
+description: Importable context-compaction library with a thin Open WebUI filter adapter.
+    It keeps conversations inside the model context window, preserves atomic tool
+    exchanges, and semantically compacts oversized tool results during recursive pipe
+    calls without fixed provider-specific result limits.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ MESSAGE_OVERHEAD_TOKENS = 20
 # summarization model in one call, so an extremely long conversation can't blow
 # out the summarizer's own context window. If exceeded, only the most recent
 # portion (still ordered oldest->newest) of the excluded messages is sent.
-SUMMARY_INPUT_TOKEN_CAP = 60000
+SUMMARY_INPUT_TOKEN_CAP = 250000
 
 # Key under chat.meta where persisted anchor/block-summary state is stored.
 CONTEXT_MANAGER_META_KEY = "context_manager"
@@ -37,6 +37,69 @@ CONTEXT_MANAGER_META_KEY = "context_manager"
 NO_TABLE_ROWS_FALLBACK_LIMIT = 200000
 NO_TABLE_ROWS_FALLBACK_CAP_PERCENT = 92
 NO_TABLE_ROWS_FALLBACK_WARNING_PERCENT = 80
+
+# === owui_manifolds/filters/context_marker.py ===
+import hashlib
+import json
+from typing import Any
+
+CONTEXT_PREPARED_KEY = "_owui_context_prepared"
+CONTEXT_PREPARED_VERSION = 1
+
+
+def context_payload_fingerprint(body: dict[str, Any]) -> str:
+    """Hash context-bearing request fields deterministically."""
+
+    payload = {
+        "messages": body.get("messages") or [],
+        "tools": body.get("tools") or [],
+        "extra_tools": body.get("extra_tools") or [],
+    }
+    try:
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception:
+        serialized = repr(payload)
+    return hashlib.sha256(serialized.encode("utf-8", "replace")).hexdigest()
+
+
+def _marker_metadata(
+    body: dict[str, Any], metadata: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    if metadata is not None:
+        return metadata
+    value = body.get("metadata")
+    return value if isinstance(value, dict) else None
+
+
+def context_is_prepared(
+    body: dict[str, Any], metadata: dict[str, Any] | None = None
+) -> bool:
+    marker_container = _marker_metadata(body, metadata)
+    marker = marker_container.get(CONTEXT_PREPARED_KEY) if marker_container else None
+    return (
+        isinstance(marker, dict)
+        and marker.get("version") == CONTEXT_PREPARED_VERSION
+        and marker.get("payload") == context_payload_fingerprint(body)
+    )
+
+
+def mark_context_prepared(
+    body: dict[str, Any], metadata: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    marker_container = _marker_metadata(body, metadata)
+    if marker_container is None:
+        marker_container = body.setdefault("metadata", {})
+    marker_container[CONTEXT_PREPARED_KEY] = {
+        "version": CONTEXT_PREPARED_VERSION,
+        "payload": context_payload_fingerprint(body),
+    }
+    return body
 
 # === owui_manifolds/filters/context_matching.py ===
 import fnmatch
@@ -152,8 +215,13 @@ class ContextModelingMixin:
 import hashlib
 from typing import Any, Dict, List, Optional
 
-from open_webui.internal.db import get_async_db_context
-from open_webui.models.chats import Chat, Chats
+try:
+    from open_webui.internal.db import get_async_db_context
+    from open_webui.models.chats import Chat, Chats
+except ImportError:  # Local unit tests and standalone library use.
+    get_async_db_context = None
+    Chat = None
+    Chats = None
 
 
 
@@ -180,6 +248,8 @@ class ContextPersistenceMixin:
         return hasher.hexdigest()
 
     async def _load_context_state(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        if Chats is None:
+            return None
         try:
             chat_model = await Chats.get_chat_by_id(chat_id)
             if not chat_model:
@@ -190,6 +260,8 @@ class ContextPersistenceMixin:
             return None
 
     async def _save_context_state(self, chat_id: str, state: Dict[str, Any]):
+        if get_async_db_context is None or Chat is None:
+            return
         try:
             async with get_async_db_context() as session:
                 chat_item = await session.get(Chat, chat_id)
@@ -205,7 +277,14 @@ class ContextPersistenceMixin:
 
 # === owui_manifolds/filters/context_summary.py ===
 import asyncio
+import inspect
+import json
 from typing import List, Optional
+
+
+
+class SummaryCallBudgetExceeded(RuntimeError):
+    pass
 
 
 try:
@@ -218,12 +297,33 @@ except ImportError:
 
 
 class ContextSummaryMixin:
-    def get_api_client(self):
-        if not OPENAI_AVAILABLE or not self.valves.api_key:
+    async def get_api_client(self):
+        if not OPENAI_AVAILABLE:
+            return None
+
+        base_url = self.valves.api_base
+        api_key = self.valves.api_key
+        source_id = self.valves.summary_provider_function_id.strip()
+        if source_id:
+            try:
+                from open_webui.models.functions import Functions
+
+                source_valves = (
+                    await Functions.get_function_valves_by_id(source_id) or {}
+                )
+                base_url = source_valves.get("BASE_URL") or base_url
+                api_key = source_valves.get("API_KEY") or api_key
+            except Exception:
+                self.debug_log(
+                    1,
+                    f"Could not load summary credentials from function {source_id}",
+                    "⚠️",
+                )
+        if not api_key:
             return None
         return AsyncOpenAI(
-            base_url=self.valves.api_base,
-            api_key=self.valves.api_key,
+            base_url=base_url,
+            api_key=api_key,
             timeout=self.valves.request_timeout,
         )
 
@@ -231,6 +331,8 @@ class ContextSummaryMixin:
         for attempt in range(self.valves.api_error_retry_times + 1):
             try:
                 return await call_func()
+            except SummaryCallBudgetExceeded:
+                return None
             except Exception as e:
                 if attempt < self.valves.api_error_retry_times:
                     self.debug_log(
@@ -250,45 +352,194 @@ class ContextSummaryMixin:
     def _messages_to_text(self, messages: List[dict]) -> str:
         parts = []
         for msg in messages:
+            role = msg.get("role", "")
             text = self.extract_text_from_content(msg.get("content", ""))
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                parts.append(
+                    f"{role} tool_calls: "
+                    f"{json.dumps(tool_calls, ensure_ascii=False, default=str)}"
+                )
             if text:
-                parts.append(f"{msg.get('role', '')}: {text}")
+                identity = ""
+                if role == "tool":
+                    identity = (
+                        f" tool_call_id={msg.get('tool_call_id', '')}"
+                        f" name={msg.get('name', '')}"
+                    )
+                parts.append(f"{role}{identity}: {text}")
         return "\n\n".join(parts)
 
-    def _cap_summary_input(self, text: str) -> str:
-        """Keep only the most recent portion of the excluded text if it would be too
-        large to safely hand to the summarization model in one call."""
-        if self.count_tokens(text) <= SUMMARY_INPUT_TOKEN_CAP:
-            return text
-        # cl100k averages ~4 chars/token; trim from the front (oldest content).
-        approx_chars = SUMMARY_INPUT_TOKEN_CAP * 4
-        return text[-approx_chars:]
+    def _summary_input_chunks(self, text: str) -> List[str]:
+        """Split without dropping content before invoking the summary model."""
 
-    async def generate_overflow_summary(
-        self, excluded_messages: List[dict]
+        if not text:
+            return []
+        input_token_cap = min(
+            SUMMARY_INPUT_TOKEN_CAP,
+            int(self.valves.summary_input_max_tokens),
+        )
+        encoding = self.token_calculator.get_encoding()
+        if encoding is not None:
+            tokens = encoding.encode(text)
+            return [
+                encoding.decode(tokens[start : start + input_token_cap])
+                for start in range(0, len(tokens), input_token_cap)
+            ]
+
+        # tiktoken is declared by the built artifacts; this fallback is only for
+        # minimal standalone environments. A BPE token cannot represent less
+        # than one source byte, so limiting UTF-8 bytes is conservative without
+        # dropping or corrupting Unicode content.
+        byte_limit = max(1, input_token_cap)
+        chunks: List[str] = []
+        start = 0
+        while start < len(text):
+            low = start + 1
+            high = min(len(text), start + byte_limit) + 1
+            while low < high:
+                middle = (low + high) // 2
+                if len(text[start:middle].encode("utf-8")) <= byte_limit:
+                    low = middle + 1
+                else:
+                    high = middle
+            end = max(start + 1, low - 1)
+            chunks.append(text[start:end])
+            start = end
+        return chunks
+
+    def _claim_summary_call(self, call_name: str) -> bool:
+        used = int(getattr(self, "_summary_calls_used", 0))
+        limit = int(self.valves.max_summary_calls_per_request)
+        if used >= limit:
+            self.debug_log(
+                1,
+                f"Summary-call safety budget exhausted before {call_name} ({used}/{limit})",
+                "🛑",
+            )
+            return False
+        self._summary_calls_used = used + 1
+        return True
+
+    async def _summarize_text(
+        self,
+        text: str,
+        *,
+        system_prompt: str,
+        call_name: str,
+        target_tokens: int | None = None,
     ) -> Optional[str]:
         client = self.get_api_client()
-        if not client:
-            return None
-        text = self._cap_summary_input(self._messages_to_text(excluded_messages))
-        if not text.strip():
+        if inspect.isawaitable(client):
+            client = await client
+        if not client or not text.strip():
             return None
 
-        async def _call():
-            response = await client.chat.completions.create(
-                model=self.valves.summary_model,
-                messages=[
-                    {"role": "system", "content": self.valves.summary_prompt},
-                    {"role": "user", "content": text},
-                ],
-                max_tokens=self.valves.summary_max_tokens,
+        target_tokens = max(
+            64,
+            min(
+                int(target_tokens or self.valves.summary_max_tokens),
+                int(self.valves.summary_max_tokens),
+            ),
+        )
+
+        async def summarize_chunk(chunk: str, index: int, count: int) -> Optional[str]:
+            user_content = (
+                f"Input chunk {index}/{count}. Preserve information from "
+                "this chunk; do not assume omitted chunks are irrelevant.\n\n"
+                f"{chunk}"
             )
-            return response.choices[0].message.content
 
-        result = await self.safe_api_call(_call, "overflow summary")
-        return result.strip() if isinstance(result, str) and result.strip() else None
+            async def _call():
+                if not self._claim_summary_call(f"{call_name} chunk {index}/{count}"):
+                    raise SummaryCallBudgetExceeded()
+                if self.valves.summary_api_style == "responses":
+                    response = await client.responses.create(
+                        model=self.valves.summary_model,
+                        instructions=system_prompt,
+                        input=user_content,
+                        max_output_tokens=target_tokens,
+                        store=False,
+                    )
+                    return response.output_text
+
+                response = await client.chat.completions.create(
+                    model=self.valves.summary_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    max_tokens=target_tokens,
+                )
+                return response.choices[0].message.content
+
+            result = await self.safe_api_call(
+                _call, f"{call_name} chunk {index}/{count}"
+            )
+            return (
+                result.strip() if isinstance(result, str) and result.strip() else None
+            )
+
+        chunks = self._summary_input_chunks(text)
+        summaries = []
+        for index, chunk in enumerate(chunks, start=1):
+            summaries.append(await summarize_chunk(chunk, index, len(chunks)))
+        if any(summary is None for summary in summaries):
+            return None
+
+        combined = "\n\n".join(summary for summary in summaries if summary)
+        # Map summaries are intermediate data. Always reduce them to the
+        # caller's assigned budget rather than accumulating one summary_max
+        # output per source chunk in the final context.
+        if len(chunks) > 1 and self.count_tokens(combined) > target_tokens:
+            return await self._summarize_text(
+                combined,
+                system_prompt=system_prompt,
+                call_name=f"{call_name} reduction",
+                target_tokens=target_tokens,
+            )
+        return combined.strip() or None
+
+    async def generate_overflow_summary(
+        self,
+        excluded_messages: List[dict],
+        target_tokens: int | None = None,
+    ) -> Optional[str]:
+        return await self._summarize_text(
+            self._messages_to_text(excluded_messages),
+            system_prompt=self.valves.summary_prompt,
+            call_name="overflow summary",
+            target_tokens=target_tokens,
+        )
+
+    async def generate_tool_result_summary(
+        self,
+        message: dict,
+        target_tokens: int | None = None,
+    ) -> Optional[str]:
+        content = self.extract_text_from_content(message.get("content", ""))
+        if not content.strip():
+            return None
+        identity = {
+            "tool_call_id": message.get("tool_call_id"),
+            "name": message.get("name"),
+        }
+        prompt = (
+            "You are compacting one tool result so an agent can continue within its "
+            "context window. Preserve concrete findings, identifiers, URLs, errors, "
+            "numbers, code/configuration details, and information needed for follow-up "
+            "tool calls. Remove repetition and irrelevant boilerplate. Do not invent "
+            "facts. Output plain text only."
+        )
+        return await self._summarize_text(
+            f"Tool result identity: {json.dumps(identity, ensure_ascii=False)}\n\n{content}",
+            system_prompt=prompt,
+            call_name="tool result summary",
+            target_tokens=target_tokens,
+        )
 
 # === owui_manifolds/filters/context_tokens.py ===
+import json
 from typing import Any, Dict, List, Optional
 
 
@@ -346,9 +597,13 @@ class ContextTokenMixin:
 
     def extract_text_from_content(self, content) -> str:
         if isinstance(content, list):
-            return " ".join(
-                item.get("text", "") for item in content if item.get("type") == "text"
-            )
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    parts.append(str(item))
+                elif item.get("type") in {"text", "input_text", "output_text"}:
+                    parts.append(str(item.get("text", "")))
+            return " ".join(part for part in parts if part)
         return str(content) if content else ""
 
     def count_message_tokens(self, message: dict) -> int:
@@ -358,19 +613,34 @@ class ContextTokenMixin:
         total = 0
         if isinstance(content, list):
             for item in content:
-                if item.get("type") == "text":
+                if not isinstance(item, dict):
+                    total += self.count_tokens(str(item))
+                elif item.get("type") in {"text", "input_text", "output_text"}:
                     total += self.count_tokens(item.get("text", ""))
-                elif item.get("type") == "image_url":
+                elif item.get("type") in {"image", "image_url", "input_image"}:
                     total += self.token_calculator.calculate_image_tokens()
+                else:
+                    total += self.count_tokens(
+                        json.dumps(item, ensure_ascii=False, default=str)
+                    )
         else:
             total = self.count_tokens(content)
+
+        # Open WebUI's recursive tool loop carries these outside ``content``.
+        # They consume provider context and must participate in budgeting.
+        for field in ("tool_calls", "reasoning_details", "output"):
+            value = message.get(field)
+            if value:
+                total += self.count_tokens(
+                    json.dumps(value, ensure_ascii=False, default=str)
+                )
         return total + MESSAGE_OVERHEAD_TOKENS
 
     def count_messages_tokens(self, messages: List[dict]) -> int:
         return sum(self.count_message_tokens(m) for m in messages)
 
-    def calculate_target_tokens(
-        self, model_name: str, current_user_tokens: int, context_target_percent: int
+    def calculate_request_input_budget(
+        self, model_name: str, context_target_percent: int
     ) -> int:
         safe_limit = self.get_model_token_limit(model_name)
         budget_limit = safe_limit * context_target_percent / 100
@@ -381,11 +651,285 @@ class ContextTokenMixin:
                 int(safe_limit * self.valves.response_buffer_percent / 100),
             ),
         )
-        target = budget_limit - current_user_tokens - response_buffer
+        return max(0, int(budget_limit - response_buffer))
+
+    def calculate_target_tokens(
+        self, model_name: str, current_user_tokens: int, context_target_percent: int
+    ) -> int:
+        request_budget = self.calculate_request_input_budget(
+            model_name, context_target_percent
+        )
+        target = request_budget - current_user_tokens
         return int(max(target, self.valves.min_target_tokens))
 
+# === owui_manifolds/shared/content.py ===
+import re
+from collections.abc import Iterable
+
+DETAILS_BLOCK_RE = re.compile(r"<details\b[^>]*>.*?</details>", re.DOTALL)
+EMPTY_CONTEXT_RE = re.compile(r"<context>\s*</context>", flags=re.DOTALL)
+SOURCE_TAGS_RE = re.compile(r"<source[^>]*>.*?</source>", flags=re.DOTALL)
+RAG_MESSAGE_RE = re.compile(r"### Task:.*?<context>.*?</context>", re.DOTALL)
+USER_CONTEXT_RE = re.compile(r"\nUser Context:\n(.*)$", flags=re.DOTALL)
+
+
+def strip_details_blocks(text: str | None) -> str:
+    return DETAILS_BLOCK_RE.sub("", text or "")
+
+
+def render_system_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict) and "text" in content:
+        return str(content.get("text", ""))
+    if isinstance(content, Iterable) and not isinstance(content, (str, bytes, dict)):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and "text" in block:
+                parts.append(str(block.get("text", "")))
+            else:
+                parts.append(str(block))
+        return "\n".join(part for part in parts if part)
+    return str(content or "")
+
+
+__all__ = [
+    "DETAILS_BLOCK_RE",
+    "EMPTY_CONTEXT_RE",
+    "RAG_MESSAGE_RE",
+    "SOURCE_TAGS_RE",
+    "USER_CONTEXT_RE",
+    "render_system_content",
+    "strip_details_blocks",
+]
+
+# === owui_manifolds/filters/context_tooling.py ===
+import hashlib
+from collections import OrderedDict
+from copy import deepcopy
+from typing import Any, Dict, List, Tuple
+
+
+_TOOL_SUMMARY_PREFIX = "[Semantically compacted tool result"
+_TOOL_SUMMARY_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_TOOL_SUMMARY_CACHE_SIZE = 128
+
+
+class ContextBudgetExceededError(RuntimeError):
+    """Raised instead of sending an oversized request to a provider."""
+
+
+def strip_legacy_details_from_messages(
+    messages: List[dict],
+) -> tuple[List[dict], int]:
+    """Remove old pipe-rendered UI blocks from assistant request history."""
+
+    normalized = deepcopy(messages)
+    removed_chars = 0
+    for message in normalized:
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            stripped = strip_details_blocks(content)
+            removed_chars += len(content) - len(stripped)
+            message["content"] = stripped
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") not in {
+                    "text",
+                    "input_text",
+                    "output_text",
+                }:
+                    continue
+                text = str(block.get("text", "") or "")
+                stripped = strip_details_blocks(text)
+                removed_chars += len(text) - len(stripped)
+                block["text"] = stripped
+    return normalized, removed_chars
+
+
+def atomic_message_units(messages: List[dict]) -> List[tuple[int, int]]:
+    """Return half-open message ranges that cannot be split safely."""
+
+    units: List[tuple[int, int]] = []
+    index = 0
+    while index < len(messages):
+        end = index + 1
+        call_ids = _tool_call_ids(messages[index])
+        if call_ids:
+            while (
+                end < len(messages)
+                and messages[end].get("role") == "tool"
+                and str(messages[end].get("tool_call_id") or "") in call_ids
+            ):
+                end += 1
+        units.append((index, end))
+        index = end
+    return units
+
+
+def _tool_call_ids(message: dict) -> set[str]:
+    return {
+        str(call.get("id"))
+        for call in (message.get("tool_calls") or [])
+        if isinstance(call, dict) and call.get("id")
+    }
+
+
+def _tool_group_start(messages: List[dict], index: int) -> int:
+    """Move a boundary before the assistant call owning adjacent tool results."""
+
+    if not (0 <= index < len(messages)) or messages[index].get("role") != "tool":
+        return index
+    result_ids: set[str] = set()
+    cursor = index
+    while cursor >= 0 and messages[cursor].get("role") == "tool":
+        call_id = messages[cursor].get("tool_call_id")
+        if call_id:
+            result_ids.add(str(call_id))
+        cursor -= 1
+    if cursor >= 0 and _tool_call_ids(messages[cursor]) & result_ids:
+        return cursor
+    return index
+
+
+def tool_safe_window_boundaries(
+    messages: List[dict], anchor_count: int, recent_count: int
+) -> Tuple[int, int]:
+    """Return anchor end/recent start without splitting tool exchanges."""
+
+    count = len(messages)
+    anchor_end = max(0, min(anchor_count, count))
+    recent_start = max(anchor_end, count - max(0, min(recent_count, count)))
+    recent_start = max(anchor_end, _tool_group_start(messages, recent_start))
+
+    if 0 < anchor_end < count:
+        group_start = _tool_group_start(messages, anchor_end)
+        if group_start < anchor_end:
+            anchor_end = group_start
+        elif _tool_call_ids(messages[anchor_end - 1]):
+            call_ids = _tool_call_ids(messages[anchor_end - 1])
+            while (
+                anchor_end < count
+                and messages[anchor_end].get("role") == "tool"
+                and str(messages[anchor_end].get("tool_call_id") or "") in call_ids
+            ):
+                anchor_end += 1
+
+    recent_start = max(anchor_end, recent_start)
+    return anchor_end, recent_start
+
+
+def _cache_key(message: dict, content: str, target_tokens: int) -> str:
+    identity = (
+        f"{message.get('tool_call_id', '')}\0{message.get('name', '')}\0"
+        f"{target_tokens}\0{content}"
+    )
+    return hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()
+
+
+def _remember_summary(key: str, summary: str) -> None:
+    _TOOL_SUMMARY_CACHE[key] = summary
+    _TOOL_SUMMARY_CACHE.move_to_end(key)
+    while len(_TOOL_SUMMARY_CACHE) > _TOOL_SUMMARY_CACHE_SIZE:
+        _TOOL_SUMMARY_CACHE.popitem(last=False)
+
+
+class ContextToolCompactionMixin:
+    async def compact_tool_results_to_budget(
+        self,
+        messages: List[dict],
+        budget: int,
+        persisted_cache: Dict[str, str] | None = None,
+    ) -> tuple[List[dict], Dict[str, str], Dict[str, Any]]:
+        """Semantically reduce tool messages only when the candidate is over budget.
+
+        The tool message and its ``tool_call_id`` remain intact. Full content is
+        never sliced: oversized source is chunked by the summary backend first.
+        """
+
+        candidate = deepcopy(messages)
+        cache = dict(persisted_cache or {})
+        original_tokens = self.count_messages_tokens(candidate)
+        if original_tokens <= budget:
+            return (
+                candidate,
+                cache,
+                {
+                    "compacted": 0,
+                    "original_tokens": original_tokens,
+                    "final_tokens": original_tokens,
+                },
+            )
+
+        tool_indexes = [
+            index
+            for index, message in enumerate(candidate)
+            if message.get("role") == "tool"
+            and self.extract_text_from_content(message.get("content", "")).strip()
+            and not self.extract_text_from_content(
+                message.get("content", "")
+            ).startswith(_TOOL_SUMMARY_PREFIX)
+        ]
+        # Reduce the largest results first; stable ordering means equally-sized
+        # earlier results compact before newer ones.
+        tool_indexes.sort(
+            key=lambda index: self.count_message_tokens(candidate[index]), reverse=True
+        )
+
+        compacted = 0
+        for index in tool_indexes:
+            if self.count_messages_tokens(candidate) <= budget:
+                break
+            message = candidate[index]
+            content = self.extract_text_from_content(message.get("content", ""))
+            message_tokens = self.count_message_tokens(message)
+            other_tokens = self.count_messages_tokens(candidate) - message_tokens
+            target_tokens = max(
+                64,
+                min(
+                    int(self.valves.summary_max_tokens),
+                    max(64, budget - other_tokens),
+                ),
+            )
+            key = _cache_key(message, content, target_tokens)
+            summary = cache.get(key) or _TOOL_SUMMARY_CACHE.get(key)
+            if not summary:
+                summary = await self.generate_tool_result_summary(
+                    message,
+                    target_tokens=target_tokens,
+                )
+            if not summary:
+                continue
+
+            _remember_summary(key, summary)
+            cache[key] = summary
+            source_tokens = self.count_tokens(content)
+            if self.count_tokens(summary) >= source_tokens:
+                continue
+            message["content"] = (
+                f"{_TOOL_SUMMARY_PREFIX}; original≈{source_tokens:,} tokens; "
+                f"content_hash={key[:12]}]\n{summary}"
+            )
+            compacted += 1
+
+        # Keep persisted chat metadata bounded. The process-local LRU still
+        # covers temporary chats and repeated requests in the current worker.
+        if len(cache) > _TOOL_SUMMARY_CACHE_SIZE:
+            cache = dict(list(cache.items())[-_TOOL_SUMMARY_CACHE_SIZE:])
+        return (
+            candidate,
+            cache,
+            {
+                "compacted": compacted,
+                "original_tokens": original_tokens,
+                "final_tokens": self.count_messages_tokens(candidate),
+            },
+        )
+
 # === owui_manifolds/filters/context_valves.py ===
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -483,6 +1027,17 @@ class ContextValves(BaseModel):
         default="doubao-1-5-lite-32k-250115",
         description="📝 Model used for overflow summarization",
     )
+    summary_api_style: Literal["chat_completions", "responses"] = Field(
+        default="chat_completions",
+        description="🧭 Native OpenAI API style used by the summary backend.",
+    )
+    summary_provider_function_id: str = Field(
+        default="",
+        description=(
+            "🔐 Optional installed pipe function ID whose BASE_URL/API_KEY valves "
+            "supply summary credentials without duplicating secrets."
+        ),
+    )
     summary_prompt: str = Field(
         default="You are compressing an older portion of a conversation so it can be "
         "dropped from the active context window without losing important information.\n\n"
@@ -498,6 +1053,24 @@ class ContextValves(BaseModel):
     )
     summary_max_tokens: int = Field(
         default=500, description="📝 Max output tokens for the overflow summary"
+    )
+    summary_input_max_tokens: int = Field(
+        default=250000,
+        ge=1000,
+        le=250000,
+        description=(
+            "🧩 Maximum input tokens per map-reduce summary chunk. All supported "
+            "summary models are expected to provide at least 262K context."
+        ),
+    )
+    max_summary_calls_per_request: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description=(
+            "🛑 Safety ceiling for summary-model calls during one request. If "
+            "compaction cannot converge within it, the provider request is refused."
+        ),
     )
     request_timeout: int = Field(
         default=90, description="⏱️ API request timeout (seconds)"
@@ -548,6 +1121,7 @@ class ContextUserValves(BaseModel):
 from typing import Any, Callable, Dict, List, Tuple
 
 
+
 class ContextWindowMixin:
     async def _ask_compress_now(
         self, event_call: Callable, history_tokens: int, budget: int
@@ -584,6 +1158,7 @@ class ContextWindowMixin:
         covered_upto: int,
         blocks: List[Dict[str, str]],
         force: bool = False,
+        preserve_latest_unit: bool = True,
     ) -> Tuple[List[dict], int, List[Dict[str, str]], Dict[str, Any]]:
         """Assemble anchor + persisted summary blocks + verbatim "pending" middle +
         recent messages, and compare THAT candidate to budget - not the raw
@@ -620,10 +1195,20 @@ class ContextWindowMixin:
                 },
             )
 
-        anchor_n = max(0, min(anchor_n, n))
-        recent_n = max(0, min(recent_n, n))
-        recent_start = max(anchor_n, n - recent_n)
+        anchor_n, recent_start = tool_safe_window_boundaries(
+            history_messages,
+            anchor_count=anchor_n,
+            recent_count=recent_n,
+        )
         covered_upto = max(anchor_n, min(covered_upto, recent_start))
+        covered_upto = max(
+            anchor_n,
+            tool_safe_window_boundaries(
+                history_messages,
+                anchor_count=covered_upto,
+                recent_count=n - recent_start,
+            )[0],
+        )
 
         anchor = history_messages[:anchor_n]
         pending = history_messages[covered_upto:recent_start]
@@ -640,19 +1225,79 @@ class ContextWindowMixin:
 
         candidate = anchor + block_messages(blocks) + pending + recent
         folded = False
+        over_budget = self.count_messages_tokens(candidate) > budget
 
-        if (
-            pending
-            and self.valves.enable_overflow_summary
-            and (force or self.count_messages_tokens(candidate) > budget)
-        ):
-            summary_text = await self.generate_overflow_summary(pending)
-            if summary_text:
-                blocks = blocks + [{"text": summary_text}]
-                covered_upto = recent_start
-                folded = True
-                pending = []
-                candidate = anchor + block_messages(blocks) + pending + recent
+        if self.valves.enable_overflow_summary and (force or over_budget):
+            # Old state can contain one map summary per former 24K chunk. Merge
+            # those blocks first so persisted summaries cannot dominate context.
+            existing_block_messages = block_messages(blocks)
+            if existing_block_messages and (
+                len(blocks) > 1
+                or self.count_messages_tokens(existing_block_messages)
+                > int(self.valves.summary_max_tokens)
+            ):
+                base_tokens = self.count_messages_tokens(anchor + pending + recent)
+                block_target = max(
+                    64,
+                    min(
+                        int(self.valves.summary_max_tokens),
+                        max(64, budget - base_tokens),
+                    ),
+                )
+                merged = await self.generate_overflow_summary(
+                    existing_block_messages,
+                    target_tokens=block_target,
+                )
+                if merged:
+                    blocks = [{"text": merged}]
+                    folded = True
+
+            excluded = list(pending)
+            fold_end = recent_start
+            remaining_recent = list(recent)
+
+            # Recent-message retention is a preference, not a hard guarantee.
+            # Move the oldest complete recent exchanges into this fold until a
+            # bounded summary plus the remaining request can fit. Always retain
+            # the newest atomic exchange for the provider continuation.
+            units = atomic_message_units(remaining_recent)
+            minimum_units = 1 if preserve_latest_unit else 0
+            while len(units) > minimum_units:
+                base = anchor + block_messages(blocks) + remaining_recent
+                projected = self.count_messages_tokens(base) + int(
+                    self.valves.summary_max_tokens
+                )
+                if projected <= budget:
+                    break
+                start, end = units[0]
+                excluded.extend(remaining_recent[start:end])
+                fold_end += end - start
+                remaining_recent = remaining_recent[end:]
+                units = atomic_message_units(remaining_recent)
+
+            if excluded:
+                base_tokens = self.count_messages_tokens(
+                    anchor + block_messages(blocks) + remaining_recent
+                )
+                summary_target = max(
+                    64,
+                    min(
+                        int(self.valves.summary_max_tokens),
+                        max(64, budget - base_tokens),
+                    ),
+                )
+                summary_text = await self.generate_overflow_summary(
+                    excluded,
+                    target_tokens=summary_target,
+                )
+                if summary_text:
+                    blocks = blocks + [{"text": summary_text}]
+                    covered_upto = fold_end
+                    folded = True
+                    pending = []
+                    recent = remaining_recent
+
+            candidate = anchor + block_messages(blocks) + pending + recent
 
         stats = {
             "kept": len(anchor) + len(pending) + len(recent),
@@ -663,15 +1308,17 @@ class ContextWindowMixin:
         return candidate, covered_upto, blocks, stats
 
 # === owui_manifolds/filters/context.py ===
+import json
 import traceback
 from typing import Any, Callable, Dict, List, Optional
 
 
 
-class Filter(
+class ContextManager(
     ContextModelingMixin,
     ContextTokenMixin,
     ContextSummaryMixin,
+    ContextToolCompactionMixin,
     ContextPersistenceMixin,
     ContextWindowMixin,
 ):
@@ -684,6 +1331,7 @@ class Filter(
         self.token_calculator = TokenCalculator()
         self._current_model_name = ""
         self._current_model_info: Dict[str, Any] = {}
+        self._summary_calls_used = 0
 
     def debug_log(self, level: int, message: str, emoji: str = "🔧"):
         if self.valves.debug_level >= level:
@@ -700,12 +1348,41 @@ class Filter(
         __chat_id__: Optional[str] = None,
         **kwargs,
     ) -> dict:
+        if context_is_prepared(body):
+            return body
+        processed = await self._process_body(
+            body,
+            user=user,
+            __event_emitter__=__event_emitter__,
+            __event_call__=__event_call__,
+            __user__=__user__,
+            __model__=__model__,
+            __chat_id__=__chat_id__,
+            **kwargs,
+        )
+        return mark_context_prepared(processed)
+
+    async def _process_body(
+        self,
+        body: dict,
+        user: Optional[dict] = None,
+        __event_emitter__: Optional[Callable] = None,
+        __event_call__: Optional[Callable] = None,
+        __user__: Optional[dict] = None,
+        __model__: Optional[dict] = None,
+        __chat_id__: Optional[str] = None,
+        **kwargs,
+    ) -> dict:
         if not self.valves.enable_processing:
             return body
 
         messages = body.get("messages", [])
         if not messages:
             return body
+
+        self._summary_calls_used = 0
+        messages, legacy_details_removed = strip_legacy_details_from_messages(messages)
+        body["messages"] = messages
 
         model_name = body.get("model", "unknown")
         base_model_id = isinstance(__model__, dict) and __model__.get("info", {}).get(
@@ -747,11 +1424,13 @@ class Filter(
             else self.valves.recent_message_count_default
         )
 
-        current_user_message = None
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                current_user_message = msg
-                break
+        # Only the trailing user message is the active prompt. During OWUI's
+        # recursive tool loop, assistant/tool messages follow that user turn;
+        # extracting and re-appending the older user message would corrupt the
+        # function-call/result ordering.
+        current_user_message = (
+            messages[-1] if messages[-1].get("role") == "user" else None
+        )
 
         system_messages = [m for m in messages if m.get("role") == "system"]
         history_messages = [
@@ -765,17 +1444,29 @@ class Filter(
             if current_user_message
             else 0
         )
-        target_tokens = self.calculate_target_tokens(
-            model_name, current_user_tokens, user_valves.context_target_percent
+        request_input_budget = self.calculate_request_input_budget(
+            model_name, user_valves.context_target_percent
         )
         system_tokens = self.count_messages_tokens(system_messages)
         history_tokens = self.count_messages_tokens(history_messages)
-        budget_for_history = target_tokens - system_tokens
+        request_overhead_tokens = sum(
+            self.count_tokens(
+                json.dumps(body.get(field), ensure_ascii=False, default=str)
+            )
+            for field in ("tools", "extra_tools")
+            if body.get(field)
+        )
+        budget_for_history = (
+            request_input_budget
+            - current_user_tokens
+            - system_tokens
+            - request_overhead_tokens
+        )
 
         self.debug_log(
             1,
             f"Budget check: history={history_tokens:,} vs budget_for_history={budget_for_history:,} "
-            f"(target={target_tokens:,}, system={system_tokens:,}, current_user={current_user_tokens:,}, "
+            f"(request_budget={request_input_budget:,}, system={system_tokens:,}, tools={request_overhead_tokens:,}, current_user={current_user_tokens:,}, "
             f"pct={user_valves.context_target_percent}, anchor={anchor_n}, recent={recent_n})",
             "📊",
         )
@@ -799,7 +1490,15 @@ class Filter(
                 blocks = state.get("blocks", [])
 
         budget = max(budget_for_history, 0)
-        over_cap = history_tokens > budget
+        estimated_request_tokens = (
+            system_tokens
+            + history_tokens
+            + current_user_tokens
+            + request_overhead_tokens
+        )
+        over_cap = (
+            history_tokens > budget or estimated_request_tokens > request_input_budget
+        )
         force_fold = False
         prompted = False
         warning_last_asked = int(state.get("warning_last_asked_msg_count", 0))
@@ -844,6 +1543,7 @@ class Filter(
                                 history_messages[:covered_upto]
                             ),
                             "blocks": blocks,
+                            "tool_summaries": state.get("tool_summaries", {}),
                             "warning_last_asked_msg_count": warning_last_asked,
                         },
                     )
@@ -859,6 +1559,7 @@ class Filter(
                     covered_upto,
                     blocks,
                     force=force_fold,
+                    preserve_latest_unit=current_user_message is None,
                 )
             )
         except Exception as e:
@@ -869,7 +1570,15 @@ class Filter(
                 traceback.print_exc()
             return body
 
-        if persistable and (stats["folded"] or prompted):
+        candidate, tool_summary_cache, tool_stats = (
+            await self.compact_tool_results_to_budget(
+                candidate,
+                budget,
+                persisted_cache=state.get("tool_summaries", {}),
+            )
+        )
+
+        if persistable and (stats["folded"] or prompted or tool_stats["compacted"]):
             new_hash = self._hash_history_prefix(history_messages[:new_covered_upto])
             await self._save_context_state(
                 __chat_id__,
@@ -877,6 +1586,7 @@ class Filter(
                     "covered_upto": new_covered_upto,
                     "covered_hash": new_hash,
                     "blocks": new_blocks,
+                    "tool_summaries": tool_summary_cache,
                     "warning_last_asked_msg_count": warning_last_asked,
                 },
             )
@@ -885,7 +1595,9 @@ class Filter(
         if current_user_message:
             final_messages.append(current_user_message)
 
-        final_tokens = self.count_messages_tokens(final_messages)
+        final_tokens = (
+            self.count_messages_tokens(final_messages) + request_overhead_tokens
+        )
 
         status_parts = [
             f"kept {stats['kept']}/{len(history_messages)} messages verbatim"
@@ -901,13 +1613,26 @@ class Filter(
                     if prompted
                     else "folded 1 new block this turn"
                 )
-        original_tokens = system_tokens + history_tokens + current_user_tokens
+        if tool_stats["compacted"]:
+            status_parts.append(
+                f"semantically compacted {tool_stats['compacted']} oversized tool result(s)"
+            )
+        if legacy_details_removed:
+            status_parts.append(
+                f"removed {legacy_details_removed:,} characters of legacy UI details"
+            )
+        original_tokens = (
+            system_tokens
+            + history_tokens
+            + current_user_tokens
+            + request_overhead_tokens
+        )
         status_msg = (
             f"Trimmed conversation history: {', '.join(status_parts)} "
             f"({original_tokens:,}→{final_tokens:,} tokens)"
         )
 
-        if __event_emitter__ and stats["folded"]:
+        if __event_emitter__ and (stats["folded"] or tool_stats["compacted"]):
             try:
                 await __event_emitter__(
                     {
@@ -920,5 +1645,35 @@ class Filter(
 
         self.debug_log(1, status_msg, "🔧")
 
+        final_budget = request_input_budget
+        if final_tokens > final_budget:
+            error_message = (
+                "Context compaction could not fit this request within the model budget "
+                f"({final_tokens:,} > {final_budget:,} estimated tokens; "
+                f"summary calls {self._summary_calls_used}/"
+                f"{self.valves.max_summary_calls_per_request})."
+            )
+            if __event_emitter__:
+                try:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": error_message,
+                                "done": True,
+                                "level": "error",
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
+            raise ContextBudgetExceededError(error_message)
+
         body["messages"] = final_messages
         return body
+
+
+class Filter(ContextManager):
+    """Thin Open WebUI filter adapter around the importable context library."""
+
+    pass

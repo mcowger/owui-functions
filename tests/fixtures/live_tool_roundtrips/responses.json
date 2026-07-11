@@ -1,0 +1,53 @@
+{
+  "provenance": {
+    "chat_id": "37bf5833-ef3c-443d-b9b6-b1d1196fb3d0",
+    "model": "openai_responses_manifold.gpt-5.6-luna",
+    "captured_from": "live OWUI tool-loop output",
+    "sanitized": true
+  },
+  "messages": [
+    {
+      "role": "assistant",
+      "content": "",
+      "reasoning_details": [
+        {
+          "type": "openai_responses",
+          "index": 0,
+          "item": {
+            "id": "rs_050f472f036f13c2006a52a8f1efec8194b00682f37d6cd850",
+            "summary": [],
+            "type": "reasoning",
+            "content": []
+          }
+        }
+      ],
+      "tool_calls": [
+        {
+          "id": "call_OHqEb8lHEkyFLqfPZyqaZo3R",
+          "type": "function",
+          "function": {
+            "name": "calculate_timestamp",
+            "arguments": "{\"days_ago\": 7, \"weeks_ago\": 0, \"months_ago\": 0, \"years_ago\": 0}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_OHqEb8lHEkyFLqfPZyqaZo3R",
+      "name": "calculate_timestamp",
+      "content": "{\"current_timestamp\":1700000000,\"calculated_timestamp\":1699395200,\"result\":\"fixture\"}"
+    }
+  ],
+  "expected": {
+    "call_id": "call_OHqEb8lHEkyFLqfPZyqaZo3R",
+    "name": "calculate_timestamp",
+    "arguments": {
+      "days_ago": 7,
+      "weeks_ago": 0,
+      "months_ago": 0,
+      "years_ago": 0
+    },
+    "tool_result_contains": "fixture"
+  }
+}

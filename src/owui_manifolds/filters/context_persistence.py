@@ -3,8 +3,13 @@
 import hashlib
 from typing import Any, Dict, List, Optional
 
-from open_webui.internal.db import get_async_db_context
-from open_webui.models.chats import Chat, Chats
+try:
+    from open_webui.internal.db import get_async_db_context
+    from open_webui.models.chats import Chat, Chats
+except ImportError:  # Local unit tests and standalone library use.
+    get_async_db_context = None
+    Chat = None
+    Chats = None
 
 from owui_manifolds.filters.context_constants import CONTEXT_MANAGER_META_KEY
 
@@ -32,6 +37,8 @@ class ContextPersistenceMixin:
         return hasher.hexdigest()
 
     async def _load_context_state(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        if Chats is None:
+            return None
         try:
             chat_model = await Chats.get_chat_by_id(chat_id)
             if not chat_model:
@@ -42,6 +49,8 @@ class ContextPersistenceMixin:
             return None
 
     async def _save_context_state(self, chat_id: str, state: Dict[str, Any]):
+        if get_async_db_context is None or Chat is None:
+            return
         try:
             async with get_async_db_context() as session:
                 chat_item = await session.get(Chat, chat_id)

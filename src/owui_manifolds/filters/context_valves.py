@@ -1,6 +1,6 @@
 """Pydantic valve models exposed through Filter.Valves and Filter.UserValves."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -98,6 +98,17 @@ class ContextValves(BaseModel):
         default="doubao-1-5-lite-32k-250115",
         description="📝 Model used for overflow summarization",
     )
+    summary_api_style: Literal["chat_completions", "responses"] = Field(
+        default="chat_completions",
+        description="🧭 Native OpenAI API style used by the summary backend.",
+    )
+    summary_provider_function_id: str = Field(
+        default="",
+        description=(
+            "🔐 Optional installed pipe function ID whose BASE_URL/API_KEY valves "
+            "supply summary credentials without duplicating secrets."
+        ),
+    )
     summary_prompt: str = Field(
         default="You are compressing an older portion of a conversation so it can be "
         "dropped from the active context window without losing important information.\n\n"
@@ -113,6 +124,24 @@ class ContextValves(BaseModel):
     )
     summary_max_tokens: int = Field(
         default=500, description="📝 Max output tokens for the overflow summary"
+    )
+    summary_input_max_tokens: int = Field(
+        default=250000,
+        ge=1000,
+        le=250000,
+        description=(
+            "🧩 Maximum input tokens per map-reduce summary chunk. All supported "
+            "summary models are expected to provide at least 262K context."
+        ),
+    )
+    max_summary_calls_per_request: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description=(
+            "🛑 Safety ceiling for summary-model calls during one request. If "
+            "compaction cannot converge within it, the provider request is refused."
+        ),
     )
     request_timeout: int = Field(
         default=90, description="⏱️ API request timeout (seconds)"

@@ -5,9 +5,9 @@ author: Justin Kropp
 author_url: https://github.com/jrkropp
 git_url: https://github.com/jrkropp/open-webui-developer-toolkit/blob/main/functions/pipes/openai_responses_manifold/openai_responses_manifold.py
 description: OpenAI Responses API Manifold
-required_open_webui_version: 0.6.28
-requirements: openai~=2.29, pydantic~=2.12
-version: 1.0.0
+required_open_webui_version: 0.10.2
+requirements: openai~=2.41, tiktoken>=0.7, pydantic~=2.13
+version: 1.1.1
 license: MIT
 
 NOTES - PLEASE READ:
@@ -100,7 +100,7 @@ class PipeValves(BaseModel):
     )
     PERSIST_TOOL_RESULTS: bool = Field(
         default=True,
-        description="Persist tool call results across conversation turns. When disabled, tool results are not stored in the chat history.",
+        description="Deprecated compatibility setting; Open WebUI now persists structured tool history.",
     )
     PARALLEL_TOOL_CALLS: bool = Field(
         default=True,
@@ -115,21 +115,11 @@ class PipeValves(BaseModel):
     )
     MAX_TOOL_CALLS: int | None = Field(
         default=None,
-        description=(
-            "Maximum number of individual tool or function calls the model can make "
-            "within a single response. Applies to the total number of calls across "
-            "all built-in tools. Further tool-call attempts beyond this limit will be ignored."
-        ),
+        description="Deprecated compatibility setting; Open WebUI owns custom-function limits.",
     )
     MAX_FUNCTION_CALL_LOOPS: int = Field(
         default=10,
-        description=(
-            "Maximum number of full execution cycles (loops) allowed per request. "
-            "Each loop involves the model generating one or more function/tool calls, "
-            "executing all requested functions, and feeding the results back into the model. "
-            "Looping stops when this limit is reached or when the model no longer requests "
-            "additional tool or function calls."
-        ),
+        description="Deprecated compatibility setting; Open WebUI owns custom-function loops.",
     )
     ENABLE_WEB_SEARCH_TOOL: bool = Field(
         default=False,
@@ -530,6 +520,7 @@ import re
 from typing import Dict, Iterable, List, TypedDict
 from urllib.parse import parse_qsl, urlencode
 
+from owui_manifolds.filters.context_runtime import prepare_context_for_pipe
 from owui_manifolds.shared.ids import CROCKFORD_ALPHABET, ULID_LENGTH, generate_ulid
 
 MARKER_PREFIX = "openai_responses:v2:"
@@ -1088,6 +1079,25 @@ class HistoryManager:
                 instructions = _render_system_content(msg.get("content"))
                 continue
 
+            if role == "tool":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    text_parts: list[str] = []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            text_parts.append(str(block))
+                        elif block.get("type") in {"text", "input_text"}:
+                            text_parts.append(str(block.get("text", "")))
+                    content = "".join(text_parts)
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": str(msg.get("tool_call_id") or ""),
+                        "output": str(content or ""),
+                    }
+                )
+                continue
+
             if role == "user":
                 blocks = msg.get("content") or []
                 if isinstance(blocks, str):
@@ -1109,6 +1119,18 @@ class HistoryManager:
             if role != "assistant":
                 continue
 
+            # Open WebUI owns the tool loop. Provider-native reasoning items
+            # needed for stateless Responses continuation are carried through
+            # its reasoning_details sidecar and restored before function calls.
+            for detail in msg.get("reasoning_details") or []:
+                if not isinstance(detail, dict) or detail.get("type") != "openai_responses":
+                    continue
+                item = detail.get("item")
+                if isinstance(item, dict) and item.get("type") == "reasoning":
+                    restored = dict(item)
+                    restored.pop("reasoning_details", None)
+                    input_items.append(restored)
+
             raw = msg.get("content", "") or ""
             if not isinstance(raw, str):
                 raw = str(raw)
@@ -1122,6 +1144,24 @@ class HistoryManager:
                     input_items.append(
                         {"role": "assistant", "content": [{"type": "output_text", "text": text}]}
                     )
+                for tool_call in msg.get("tool_calls") or []:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function") or {}
+                    call_id = str(tool_call.get("id") or "")
+                    name = str(function.get("name") or "")
+                    arguments = function.get("arguments", "{}")
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments)
+                    if call_id and name:
+                        input_items.append(
+                            {
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": arguments,
+                            }
+                        )
                 continue
 
             for segment in split_text_by_markers(raw):
@@ -1147,6 +1187,27 @@ class HistoryManager:
                                 "content": [{"type": "output_text", "text": text}],
                             }
                         )
+
+            # Legacy marker-bearing messages can also carry Open WebUI-native
+            # tool_calls. Preserve those after restoring any side-table items.
+            for tool_call in msg.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function") or {}
+                call_id = str(tool_call.get("id") or "")
+                name = str(function.get("name") or "")
+                arguments = function.get("arguments", "{}")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments)
+                if call_id and name:
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    )
 
         return input_items, instructions
 
@@ -2369,8 +2430,37 @@ async def _emit_server_tool_status(
         logger.debug("Failed to emit server-side tool status", exc_info=True)
 
 
+def _attach_responses_reasoning_details(event: dict[str, Any]) -> dict[str, Any]:
+    """Carry native reasoning items through Open WebUI's tool-loop sidecar.
+
+    Open WebUI converts provider output into assistant ``tool_calls`` before
+    reinvoking a pipe. Its ``reasoning_details`` extension survives that
+    conversion, while arbitrary Responses reasoning items do not. Attach a
+    clean copy so encrypted/stateless continuation data can be reconstructed.
+    """
+
+    def enrich(item: Any) -> Any:
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            return item
+        native = deepcopy(item)
+        native.pop("reasoning_details", None)
+        enriched = dict(item)
+        enriched["reasoning_details"] = [
+            {"type": "openai_responses", "index": 0, "item": native}
+        ]
+        return enriched
+
+    adapted = deepcopy(event)
+    if isinstance(adapted.get("item"), dict):
+        adapted["item"] = enrich(adapted["item"])
+    response = adapted.get("response")
+    if isinstance(response, dict) and isinstance(response.get("output"), list):
+        response["output"] = [enrich(item) for item in response["output"]]
+    return adapted
+
+
 class ResponsesEngine:
-    """Orchestrate a single streaming turn against the Responses API."""
+    """Translate one OpenAI Responses API call for Open WebUI."""
 
     _TERMINAL_RESPONSE_EVENTS = {
         "response.completed",
@@ -2389,205 +2479,44 @@ class ResponsesEngine:
         self._history_manager = history_manager
         self._logger = logger or _LOGGER
 
-    async def run_streaming_turn(
+    async def stream_single_turn(
         self,
         request: dict[str, Any],
         ctx: TurnContext,
-        events: RuntimeEvents,
-        history_key: dict[str, Any],
-        tool_executor,
-    ) -> TurnResult:
-        cfg: RuntimeConfig = ctx.runtime_config
-        state = TurnState()
-        result: TurnResult | None = None
-        final_text: str = ""
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream exactly one provider response back to Open WebUI.
 
-        try:
-            # Each iteration streams one response and executes any tool calls.
-            # We need MAX_FUNCTION_CALL_LOOPS tool-call iterations PLUS one final
-            # response to get the model's text answer, so range is +1.
-            for loop_iteration in range(cfg.MAX_FUNCTION_CALL_LOOPS + 1):
-                self._logger.debug(
-                    "run_streaming_turn: iteration=%s starting stream", loop_iteration
-                )
-                response = await self._stream_single_response(
-                    request=request,
-                    ctx=ctx,
-                    state=state,
-                    events=events,
-                    base_url=cfg.BASE_URL,
-                    api_key=cfg.API_KEY,
-                )
-                if response is None:
-                    self._logger.debug(
-                        "run_streaming_turn: iteration=%s response is None, breaking",
-                        loop_iteration,
-                    )
-                    break
-                self._merge_usage(state, response)
+        Open WebUI 0.10.2 owns custom-function execution and reinvokes the
+        pipe with function_call_output messages. Keeping the provider call
+        single-shot prevents this manifold from duplicating OWUI's tool loop.
+        """
 
-                tool_calls = self._extract_tool_calls(response)
-                self._logger.debug(
-                    "run_streaming_turn: iteration=%s extracted %d tool_calls: %s",
-                    loop_iteration,
-                    len(tool_calls),
-                    [f"{c.name}({c.call_id})" for c in tool_calls],
-                )
-                if not tool_calls:
-                    self._logger.debug(
-                        "run_streaming_turn: iteration=%s no tool_calls, "
-                        "visible_text_len=%d internal_text_len=%d, breaking",
-                        loop_iteration,
-                        len(state.assistant_visible_text),
-                        len(state.assistant_internal_text),
-                    )
-                    break
+        completed_items: list[dict[str, Any]] = []
+        async for event in self._client.stream_responses(
+            request,
+            base_url=ctx.runtime_config.BASE_URL,
+            api_key=ctx.runtime_config.API_KEY,
+            max_retries=ctx.runtime_config.MAX_RETRIES,
+        ):
+            adapted = _attach_responses_reasoning_details(event)
+            if adapted.get("type") == "response.output_item.done" and isinstance(
+                adapted.get("item"), dict
+            ):
+                completed_items.append(adapted["item"])
 
-                if loop_iteration >= cfg.MAX_FUNCTION_CALL_LOOPS:
-                    await events.status(
-                        f"Tool call limit ({cfg.MAX_TOOL_CALLS}) reached. Stopping further tool calls.",
-                        done=False,
-                    )
-                    break
+            # Some compatible proxies return an empty completed.output even
+            # though they streamed output_item.done events. Repair the terminal
+            # snapshot before OWUI consumes it, otherwise OWUI discards the
+            # function calls it already assembled.
+            if adapted.get("type") == "response.completed":
+                response = adapted.get("response") or {}
+                if completed_items and not response.get("output"):
+                    response["output"] = deepcopy(completed_items)
+                    adapted["response"] = response
 
-                if cfg.MAX_TOOL_CALLS is not None and (
-                    state.tool_calls_executed + len(tool_calls) > cfg.MAX_TOOL_CALLS
-                ):
-                    await events.status(
-                        f"Tool call limit ({cfg.MAX_TOOL_CALLS}) reached. Stopping further tool calls.",
-                        done=False,
-                    )
-                    break
-
-                tool_results = await tool_executor.execute(tool_calls)
-                state.tool_calls_executed += len(tool_results)
-                self._logger.debug(
-                    "run_streaming_turn: iteration=%s executed %d tool_calls, "
-                    "results statuses=%s",
-                    loop_iteration,
-                    len(tool_results),
-                    [r.status for r in tool_results],
-                )
-
-                # Emit each tool call as a collapsible <details type="tool_calls"> block
-                # so Open WebUI renders the expandable input/output UI.
-                for call, result in zip(tool_calls, tool_results):
-                    block = _format_tool_call_delta(call, result)
-                    state.assistant_visible_text += block
-                    # Do not add to internal_text — details blocks must not
-                    # appear in history context sent back to the API.
-                    self._logger.debug(
-                        "run_streaming_turn: emitting tool_call delta block "
-                        "(len=%d) for call=%s: %r",
-                        len(block),
-                        call.name,
-                        block[:200],
-                    )
-                    await events.delta(block)
-
-                call_items = self._extract_function_call_items(response)
-                result_items = self._tool_results_to_output_items(tool_results)
-                # Persist both the function_call and function_call_output items
-                # so that future turns can reconstruct the full exchange from history.
-                # Order matters: call must precede its output.
-                for item in call_items:
-                    self._record_structured_item(item, state, cfg)
-                for item in result_items:
-                    self._record_structured_item(item, state, cfg)
-
-                # Always use the stateless approach: append function_call items
-                # followed by function_call_output items to the existing input.
-                # previous_response_id is not used because proxy endpoints
-                # (e.g. LiteLLM) do not persist responses server-side and
-                # return response_not_found on the next request.
-                request["input"] = (request.get("input") or []) + call_items + result_items
-        except Exception as exc:
-            self._logger.exception("Streaming turn failed")
-            state.error_message = state.error_message or f"Internal error: {exc}"
-            if not state.assistant_internal_text:
-                state.assistant_internal_text = state.error_message or ""
-            try:
-                await events.status("Request failed — see logs for details.", done=True, level="error")
-            except Exception:
-                self._logger.debug("Failed to emit failure status", exc_info=True)
-        finally:
-            # visible_text includes <details> blocks for UI rendering.
-            # internal_text is clean prose only, used for API history context.
-            # Store visible_text so blocks persist on page reload, but use
-            # internal_text when reconstructing input for future API calls.
-            final_text = state.assistant_visible_text or state.assistant_internal_text or state.error_message or ""
-            self._logger.debug(
-                "run_streaming_turn finally: pre-persist final_text_len=%d "
-                "visible_len=%d internal_len=%d error=%r final_text_preview=%r",
-                len(final_text),
-                len(state.assistant_visible_text),
-                len(state.assistant_internal_text),
-                state.error_message,
-                final_text[:300],
-            )
-            items_to_persist = [
-                item for item in state.structured_items if _should_persist_item(item, cfg)
-            ]
-            try:
-                final_text = self._history_manager.persist_items_for_message(
-                    chat_key=history_key,
-                    message_id=str(ctx.metadata.get("message_id", "")),
-                    items=items_to_persist,
-                    model_id=ctx.model_id,
-                    openwebui_model_id=str(ctx.metadata.get("owui_model_id", "")),
-                    current_assistant_text=final_text,
-                    marker_placeholder=MARKER_PLACEHOLDER,
-                )
-            except Exception:
-                self._logger.exception("Failed to persist history items")
-
-            try:
-                await emit_pending_code_interpreter_result(
-                    state, events, self._logger, assistant_text=final_text
-                )
-            except Exception:
-                self._logger.exception("Failed to emit pending CI result citation")
-
-            result = TurnResult(
-                text=final_text,
-                usage=state.usage,
-                citations=list(state.citations),
-                error=state.error_message,
-            )
-
-            try:
-                if state.error_message:
-                    await events.status(state.error_message, done=True, level="error")
-            except Exception:
-                self._logger.debug("Failed to emit terminal status", exc_info=True)
-
-            try:
-                # `final_text` is the post-persistence version of the assistant
-                # content. The mutable visible buffer may still contain marker
-                # placeholders added while recording structured items, especially
-                # when a turn is cancelled after tool execution.
-                completion_content = final_text
-                self._logger.debug(
-                    "run_streaming_turn finally: emitting terminal chat_completion "
-                    "content_len=%d error=%r content_preview=%r",
-                    len(completion_content),
-                    state.error_message,
-                    completion_content[:300],
-                )
-                await events.chat_completion({
-                    "content": completion_content,
-                    "usage": state.usage,
-                    "error": state.error_message,
-                    "done": True,
-                })
-            except Exception:
-                self._logger.exception("Failed to emit chat_completion")
-            try:
-                await self._emit_log_citation(ctx, state, events)
-            except Exception:
-                self._logger.exception("Failed to emit log citation")
-
-        return result
+            yield adapted
+            if adapted.get("type") in self._TERMINAL_RESPONSE_EVENTS:
+                break
 
     async def run_task(self, request: dict[str, Any], ctx: TurnContext) -> str:
         request["stream"] = False
@@ -3460,9 +3389,8 @@ def map_completions_to_responses(
     history_manager: HistoryManager,
     history_key: dict,
 ) -> Tuple[dict[str, Any], list[dict], list[dict]]:
-    messages = body.get("messages") or []
     input_items, instructions = history_manager.build_input_from_messages(
-        messages=messages,
+        messages=body.get("messages") or [],
         chat_key=history_key,
         model_id=ctx.model_id,
         openwebui_model_id=ctx.metadata.get("owui_model_id"),
@@ -3741,6 +3669,15 @@ class Pipe:
             user_id=(__user__ or {}).get("id"),
         ):
             await self._maybe_unclamp_status(__event_call__)
+            if __task__ is None:
+                body = await prepare_context_for_pipe(
+                    body,
+                    model_id=base_model(str(body.get("model") or cfg.MODEL_ID)),
+                    user=__user__,
+                    chat_id=(__metadata__ or {}).get("chat_id"),
+                    metadata=__metadata__,
+                    event_emitter=__event_emitter__,
+                )
             ctx = build_turn_context(
                 pipe_valves=pipe_valves,
                 user_valves=user_valves,
@@ -3752,12 +3689,6 @@ class Pipe:
             history_key = {"chat_id": (__metadata__ or {}).get("chat_id"), "pipe_id": self.id}
             resolved_tools = await self._resolve_tools(__tools__ or {})
             registry = OpenWebUIToolRegistry(resolved_tools)
-            executor = OpenWebUIToolExecutor(
-                resolved_tools,
-                parallel=cfg.PARALLEL_TOOL_CALLS,
-                event_call=__event_call__,
-                metadata=__metadata__,
-            )
 
             if __task__ is not None:
                 request = map_completions_to_responses(
@@ -3788,17 +3719,25 @@ class Pipe:
             )
             self._apply_request_config(request, cfg, ctx)
 
-            result = await self.engine.run_streaming_turn(
-                request=request,
-                ctx=ctx,
-                events=events,
-                history_key=history_key,
-                tool_executor=executor,
-            )
+            async def _stream_one_response() -> AsyncIterator[dict[str, Any]]:
+                try:
+                    async for event in self.engine.stream_single_turn(request, ctx):
+                        yield event
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.engine._logger.exception("Responses API stream failed")
+                    yield {
+                        "type": "response.failed",
+                        "response": {
+                            "error": {
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            }
+                        },
+                    }
 
-            await self._persist_result_citations(result, __metadata__)
-
-            return result.text
+            return _stream_one_response()
 
 
 __all__ = ["Pipe"]

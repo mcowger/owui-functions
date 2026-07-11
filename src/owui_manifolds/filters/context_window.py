@@ -2,6 +2,11 @@
 
 from typing import Any, Callable, Dict, List, Tuple
 
+from owui_manifolds.filters.context_tooling import (
+    atomic_message_units,
+    tool_safe_window_boundaries,
+)
+
 
 class ContextWindowMixin:
     async def _ask_compress_now(
@@ -39,6 +44,7 @@ class ContextWindowMixin:
         covered_upto: int,
         blocks: List[Dict[str, str]],
         force: bool = False,
+        preserve_latest_unit: bool = True,
     ) -> Tuple[List[dict], int, List[Dict[str, str]], Dict[str, Any]]:
         """Assemble anchor + persisted summary blocks + verbatim "pending" middle +
         recent messages, and compare THAT candidate to budget - not the raw
@@ -75,10 +81,20 @@ class ContextWindowMixin:
                 },
             )
 
-        anchor_n = max(0, min(anchor_n, n))
-        recent_n = max(0, min(recent_n, n))
-        recent_start = max(anchor_n, n - recent_n)
+        anchor_n, recent_start = tool_safe_window_boundaries(
+            history_messages,
+            anchor_count=anchor_n,
+            recent_count=recent_n,
+        )
         covered_upto = max(anchor_n, min(covered_upto, recent_start))
+        covered_upto = max(
+            anchor_n,
+            tool_safe_window_boundaries(
+                history_messages,
+                anchor_count=covered_upto,
+                recent_count=n - recent_start,
+            )[0],
+        )
 
         anchor = history_messages[:anchor_n]
         pending = history_messages[covered_upto:recent_start]
@@ -95,19 +111,79 @@ class ContextWindowMixin:
 
         candidate = anchor + block_messages(blocks) + pending + recent
         folded = False
+        over_budget = self.count_messages_tokens(candidate) > budget
 
-        if (
-            pending
-            and self.valves.enable_overflow_summary
-            and (force or self.count_messages_tokens(candidate) > budget)
-        ):
-            summary_text = await self.generate_overflow_summary(pending)
-            if summary_text:
-                blocks = blocks + [{"text": summary_text}]
-                covered_upto = recent_start
-                folded = True
-                pending = []
-                candidate = anchor + block_messages(blocks) + pending + recent
+        if self.valves.enable_overflow_summary and (force or over_budget):
+            # Old state can contain one map summary per former 24K chunk. Merge
+            # those blocks first so persisted summaries cannot dominate context.
+            existing_block_messages = block_messages(blocks)
+            if existing_block_messages and (
+                len(blocks) > 1
+                or self.count_messages_tokens(existing_block_messages)
+                > int(self.valves.summary_max_tokens)
+            ):
+                base_tokens = self.count_messages_tokens(anchor + pending + recent)
+                block_target = max(
+                    64,
+                    min(
+                        int(self.valves.summary_max_tokens),
+                        max(64, budget - base_tokens),
+                    ),
+                )
+                merged = await self.generate_overflow_summary(
+                    existing_block_messages,
+                    target_tokens=block_target,
+                )
+                if merged:
+                    blocks = [{"text": merged}]
+                    folded = True
+
+            excluded = list(pending)
+            fold_end = recent_start
+            remaining_recent = list(recent)
+
+            # Recent-message retention is a preference, not a hard guarantee.
+            # Move the oldest complete recent exchanges into this fold until a
+            # bounded summary plus the remaining request can fit. Always retain
+            # the newest atomic exchange for the provider continuation.
+            units = atomic_message_units(remaining_recent)
+            minimum_units = 1 if preserve_latest_unit else 0
+            while len(units) > minimum_units:
+                base = anchor + block_messages(blocks) + remaining_recent
+                projected = self.count_messages_tokens(base) + int(
+                    self.valves.summary_max_tokens
+                )
+                if projected <= budget:
+                    break
+                start, end = units[0]
+                excluded.extend(remaining_recent[start:end])
+                fold_end += end - start
+                remaining_recent = remaining_recent[end:]
+                units = atomic_message_units(remaining_recent)
+
+            if excluded:
+                base_tokens = self.count_messages_tokens(
+                    anchor + block_messages(blocks) + remaining_recent
+                )
+                summary_target = max(
+                    64,
+                    min(
+                        int(self.valves.summary_max_tokens),
+                        max(64, budget - base_tokens),
+                    ),
+                )
+                summary_text = await self.generate_overflow_summary(
+                    excluded,
+                    target_tokens=summary_target,
+                )
+                if summary_text:
+                    blocks = blocks + [{"text": summary_text}]
+                    covered_upto = fold_end
+                    folded = True
+                    pending = []
+                    recent = remaining_recent
+
+            candidate = anchor + block_messages(blocks) + pending + recent
 
         stats = {
             "kept": len(anchor) + len(pending) + len(recent),

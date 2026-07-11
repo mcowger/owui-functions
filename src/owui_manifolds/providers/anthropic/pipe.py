@@ -3,9 +3,10 @@ title: Anthropic API Manifold
 id: anthropic
 author: Podden (forked)
 original_author: Balaxxe / nbellochi
-version: 1.0.0
+version: 1.1.1
 license: MIT
-requirements: anthropic>=0.103, pydantic>=2.0
+required_open_webui_version: 0.10.2
+requirements: anthropic>=0.103, openai~=2.41, tiktoken>=0.7, pydantic~=2.13
 
 A lean Open WebUI manifold for Anthropic Claude models. Parsing is delegated
 to the Anthropic Python SDK's high-level streaming helpers; this file only
@@ -14,8 +15,8 @@ history reconstruction, event emission, citations).
 
 Supported:
 - Streaming responses via the stable client.messages.stream()
-- Client tool-call loop (Open WebUI __tools__)
-- Multi-turn tool-call history reconstruction
+- Open WebUI-owned custom-function loops
+- Native thinking/tool continuation through reasoning_details
 - Extended thinking (unified EFFORT control: off/adaptive/low/medium/high/xhigh/max)
 - web_search + web_fetch server tools with citations
 - Image input (vision)
@@ -35,10 +36,21 @@ import re
 import time
 import traceback
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+)
 
 from pydantic import BaseModel, Field
 
+from owui_manifolds.filters.context_runtime import prepare_context_for_pipe
 from owui_manifolds.shared.history_store import OpenWebUIItemStore
 from owui_manifolds.shared.ids import generate_ulid
 from owui_manifolds.shared.rendering import (
@@ -116,6 +128,7 @@ PATTERN_REASONING_BLOCK = re.compile(
     flags=re.DOTALL,
 )
 
+
 # ---------------------------------------------------------------------------
 # Side-table storage for full-size tool call/result payloads.
 #
@@ -146,7 +159,9 @@ class ToolResultStore:
 
     async def save(self, chat_id: Optional[str], ulid: str, payload: dict) -> bool:
         try:
-            return (await self._store.save_item(chat_id, payload, ulid=ulid)) is not None
+            return (
+                await self._store.save_item(chat_id, payload, ulid=ulid)
+            ) is not None
         except Exception as exc:
             logger.warning("ToolResultStore.save failed: %s", exc)
             return False
@@ -206,7 +221,10 @@ class Pipe:
             default=15,
             ge=1,
             le=9999,
-            description="Maximum number of tool execution loops per request.",
+            description=(
+                "Maximum provider-only pause_turn/compaction continuations. "
+                "Open WebUI owns custom-function loops."
+            ),
         )
         MAX_RETRIES: int = Field(
             default=3,
@@ -235,24 +253,11 @@ class Pipe:
             le=9999,
             description="Timeout in seconds for individual tool execution.",
         )
-        MAX_TOOL_RESULT_CHARS: int = Field(
-            default=4000,
-            ge=200,
-            le=1000000,
-            description=(
-                "Maximum characters of a tool result shown in the rendered "
-                "<details> block and sent back to the model on this turn. "
-                "The full result is still persisted to the side-table (see "
-                "PERSIST_TOOL_RESULTS) and used when reconstructing history."
-            ),
-        )
         PERSIST_TOOL_RESULTS: bool = Field(
             default=True,
             description=(
-                "Persist full tool call results to a side-table (chat.chat) "
-                "instead of re-embedding them in full on every subsequent "
-                "turn. When disabled, only the truncated preview is kept "
-                "and replayed."
+                "Deprecated compatibility setting for legacy rendered tool history; "
+                "Open WebUI now persists structured tool output."
             ),
         )
         WEB_SEARCH_USER_CITY: str = Field(
@@ -479,20 +484,59 @@ class Pipe:
                     messages.append({"role": "user", "content": [block]})
                 continue
 
-            # Assistant turn carrying our own <details type="tool_calls"> blocks:
-            # rebuild the tool_use/tool_result exchange so multi-turn tool
-            # conversations survive.
-            if (
-                role == "assistant"
-                and isinstance(raw_content, str)
-                and '<details type="tool_calls"' in raw_content
-            ):
-                parsed = await self._parse_assistant_tool_calls(raw_content, chat_id)
-                if parsed:
-                    messages.extend(parsed)
+            if role == "assistant":
+                # Open WebUI preserves this extension when it executes tools
+                # and reinvokes the pipe. Restore native thinking signatures
+                # and tool_use blocks before adding tool_result messages.
+                native_blocks: list[dict[str, Any]] = []
+                for detail in msg.get("reasoning_details") or []:
+                    if (
+                        not isinstance(detail, dict)
+                        or detail.get("type") != "anthropic"
+                    ):
+                        continue
+                    for block in detail.get("content") or []:
+                        if isinstance(block, dict):
+                            native_blocks.append(dict(block))
+                if native_blocks:
+                    messages.append({"role": "assistant", "content": native_blocks})
                     continue
 
+                # Legacy assistant turns rendered tool calls into HTML.
+                if (
+                    isinstance(raw_content, str)
+                    and '<details type="tool_calls"' in raw_content
+                ):
+                    parsed = await self._parse_assistant_tool_calls(
+                        raw_content, chat_id
+                    )
+                    if parsed:
+                        messages.extend(parsed)
+                        continue
+
             blocks = self._convert_content(raw_content, role=role)
+            if role == "assistant":
+                for tool_call in msg.get("tool_calls") or []:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function") or {}
+                    name = str(function.get("name") or "")
+                    tool_id = str(tool_call.get("id") or "")
+                    arguments = function.get("arguments") or {}
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except ValueError:
+                            arguments = {}
+                    if name and tool_id:
+                        blocks.append(
+                            {
+                                "type": "tool_use",
+                                "id": tool_id,
+                                "name": name,
+                                "input": arguments,
+                            }
+                        )
             if not blocks:
                 continue
 
@@ -948,7 +992,14 @@ class Pipe:
             payload["tools"] = claude_tools
 
         self._apply_cache_control(payload)
-        client_tool_names = self._client_tool_names(tools)
+        client_tool_names = {
+            str(tool.get("name"))
+            for tool in claude_tools
+            if tool.get("name")
+            and not str(tool.get("type") or "").startswith(
+                ("web_search_", "web_fetch_")
+            )
+        }
         return payload, client_tool_names
 
     # -----------------------------------------------------------------
@@ -1256,6 +1307,154 @@ class Pipe:
             logger.debug("Task model error: %s", exc)
             return ""
 
+    @staticmethod
+    def _openai_stream_chunk(
+        model: str,
+        *,
+        delta: Optional[dict[str, Any]] = None,
+        finish_reason: Optional[str] = None,
+        usage: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        chunk: dict[str, Any] = {
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta or {},
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+        if usage:
+            chunk["usage"] = usage
+        return chunk
+
+    async def _stream_native_once(
+        self,
+        *,
+        payload: dict[str, Any],
+        client_tool_names: set[str],
+        api_key: str,
+        emit: Callable[[dict], Awaitable[None]],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Adapt native Anthropic streams while Open WebUI owns tool calls."""
+
+        client = self._make_client(api_key)
+        model = str(payload.get("model") or "")
+        citation_counter = 0
+
+        try:
+            # pause_turn/compaction are provider continuations, not custom
+            # function calls. Continue those internally without executing tools.
+            for _ in range(self.valves.MAX_TOOL_CALLS + 1):
+                async with client.messages.stream(**payload) as stream:
+                    try:
+                        async for event in stream:
+                            event_type = getattr(event, "type", None)
+                            if event_type == "text":
+                                text = getattr(event, "text", "") or ""
+                                if text:
+                                    yield self._openai_stream_chunk(
+                                        model, delta={"content": text}
+                                    )
+                            elif event_type == "citation":
+                                citation = getattr(event, "citation", None)
+                                if citation is not None:
+                                    citation_counter += 1
+                                    await self._emit_citation(
+                                        citation, emit, citation_counter
+                                    )
+                            elif event_type == "content_block_stop":
+                                block = getattr(event, "content_block", None)
+                                if getattr(block, "type", None) == "thinking":
+                                    thinking = getattr(block, "thinking", "") or ""
+                                    if thinking:
+                                        yield self._openai_stream_chunk(
+                                            model,
+                                            delta={"reasoning_content": thinking},
+                                        )
+                    except ValueError as exc:
+                        logger.warning(
+                            "Malformed Anthropic tool input JSON; using final snapshot: %s",
+                            exc,
+                        )
+                    message = await stream.get_final_message()
+
+                native_blocks = self._message_to_api_blocks(message)
+                tool_calls = self._tool_calls_from_message(message, client_tool_names)
+                usage_obj = getattr(message, "usage", None)
+                usage = (
+                    usage_obj.model_dump(mode="json", exclude_none=True)
+                    if hasattr(usage_obj, "model_dump")
+                    else None
+                )
+
+                if tool_calls:
+                    yield self._openai_stream_chunk(
+                        model,
+                        delta={
+                            "reasoning_details": [
+                                {
+                                    "type": "anthropic",
+                                    "index": 0,
+                                    "content": native_blocks,
+                                }
+                            ]
+                        },
+                    )
+                    for index, call in enumerate(tool_calls):
+                        yield self._openai_stream_chunk(
+                            model,
+                            delta={
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": call["id"],
+                                        "type": "function",
+                                        "function": {
+                                            "name": call["name"],
+                                            "arguments": json.dumps(
+                                                call["input"], ensure_ascii=False
+                                            ),
+                                        },
+                                    }
+                                ]
+                            },
+                        )
+                    yield self._openai_stream_chunk(
+                        model, finish_reason="tool_calls", usage=usage
+                    )
+                    return
+
+                stop_reason = getattr(message, "stop_reason", None)
+                if stop_reason in {"pause_turn", "compaction"}:
+                    payload["messages"].append(
+                        {"role": "assistant", "content": native_blocks}
+                    )
+                    self._apply_cache_control(payload)
+                    continue
+
+                suffix = self._stop_reason_suffix(message, stop_reason)
+                if suffix:
+                    yield self._openai_stream_chunk(model, delta={"content": suffix})
+                yield self._openai_stream_chunk(
+                    model, finish_reason="stop", usage=usage
+                )
+                return
+
+            yield {
+                "error": {
+                    "message": "Anthropic provider continuation limit reached",
+                    "type": "continuation_limit",
+                }
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._handle_error(exc, emit)
+            yield {"error": {"message": str(exc), "type": type(exc).__name__}}
+
     # -----------------------------------------------------------------
     # Main entry point.
     # -----------------------------------------------------------------
@@ -1321,6 +1520,17 @@ class Pipe:
             if __task__:
                 return await self._run_task(__task_body__ or body)
 
+            body = await prepare_context_for_pipe(
+                body,
+                model_id=str(body.get("model") or "")
+                .split("/")[-1]
+                .removeprefix(f"{self.id}."),
+                user=__user__,
+                chat_id=metadata.get("chat_id"),
+                metadata=metadata,
+                event_emitter=__event_emitter__,
+            )
+
             if inspect.isawaitable(__tools__):
                 __tools__ = await __tools__
             tools = __tools__ or {}
@@ -1337,216 +1547,20 @@ class Pipe:
                 chat_id=metadata.get("chat_id"),
             )
 
-            result = await self._run_streaming_turn(
-                payload=payload,
-                client_tool_names=client_tool_names,
-                api_key=api_key,
-                tools=tools,
-                metadata=metadata,
-                user=__user__,
-                request=__request__,
-                emit=emit,
-                status=status,
-                delta=delta,
-                replace=replace,
-                event_call=__event_call__,
-            )
-
             if body.get("stream", False):
+                return self._stream_native_once(
+                    payload=payload,
+                    client_tool_names=client_tool_names,
+                    api_key=api_key,
+                    emit=emit,
+                )
 
-                async def _single_chunk():
-                    if result:
-                        yield result
-
-                return _single_chunk()
-            return result
+            return "Error: Streaming is required for Anthropic chat."
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             await self._handle_error(exc, emit)
             return f"Error: {exc}"
-
-    # -----------------------------------------------------------------
-    # Streaming tool loop.
-    # -----------------------------------------------------------------
-    async def _run_streaming_turn(
-        self,
-        *,
-        payload: dict,
-        client_tool_names: set[str],
-        api_key: str,
-        tools: dict,
-        metadata: dict,
-        user: dict,
-        request: Any,
-        emit: Callable,
-        status: Callable,
-        delta: Callable,
-        replace: Callable,
-        event_call: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]] = None,
-    ) -> str:
-        client = self._make_client(api_key)
-        visible_text = ""
-        citation_counter = 0
-        tool_calls_executed = 0
-
-        async def emit_block(rendered: str) -> None:
-            # A <details> block must start on its own line, else Open WebUI
-            # renders it as inline escaped text instead of a collapsible block.
-            nonlocal visible_text
-            sep = "" if (not visible_text or visible_text.endswith("\n")) else "\n"
-            piece = sep + rendered
-            visible_text += piece
-            await delta(piece)
-
-        for loop_index in range(self.valves.MAX_TOOL_CALLS + 1):
-            async with client.messages.stream(**payload) as stream:
-                try:
-                    async for event in stream:
-                        etype = getattr(event, "type", None)
-
-                        if etype == "text":
-                            # High-level accumulated text event.
-                            chunk = getattr(event, "text", "") or ""
-                            if chunk:
-                                visible_text += chunk
-                                await delta(chunk)
-
-                        elif etype == "citation":
-                            citation = getattr(event, "citation", None)
-                            if citation is not None:
-                                citation_counter += 1
-                                await self._emit_citation(
-                                    citation, emit, citation_counter
-                                )
-
-                        elif etype == "content_block_stop":
-                            block = getattr(event, "content_block", None)
-                            btype = getattr(block, "type", None)
-                            if btype == "thinking":
-                                text = getattr(block, "thinking", "") or ""
-                                sig = getattr(block, "signature", "") or ""
-                                if text:
-                                    rendered = self._format_thinking_block(text, sig)
-                                    await emit_block(rendered)
-                except ValueError as exc:
-                    # The SDK parses streamed tool_use input JSON incrementally
-                    # (jiter, partial_mode=True). If the model/provider emits
-                    # syntactically invalid JSON (e.g. a dangling
-                    # `"key": ` with no value before the block closes), jiter
-                    # raises ValueError and aborts the async generator. The
-                    # snapshot accumulated so far (all fully-closed content
-                    # blocks, plus whatever partial input the broken block had
-                    # before the failed delta) is still usable, so we log and
-                    # fall through to get_final_message() instead of crashing
-                    # the whole turn.
-                    logger.warning(
-                        "Malformed tool input JSON from stream, using partial "
-                        "snapshot: %s",
-                        exc,
-                    )
-
-                message = await stream.get_final_message()
-
-            stop_reason = getattr(message, "stop_reason", None)
-            logger.debug("stop_reason=%s loop=%d", stop_reason, loop_index)
-
-            tool_calls = self._tool_calls_from_message(message, client_tool_names)
-
-            if not tool_calls:
-                suffix = self._stop_reason_suffix(message, stop_reason)
-                if suffix:
-                    visible_text += suffix
-                    await delta(suffix)
-                # pause_turn / compaction: API wants us to continue the same turn.
-                if stop_reason in ("pause_turn", "compaction"):
-                    payload["messages"].append(
-                        {
-                            "role": "assistant",
-                            "content": self._message_to_api_blocks(message),
-                        }
-                    )
-                    self._apply_cache_control(payload)
-                    continue
-                break
-
-            if tool_calls_executed + len(tool_calls) > self.valves.MAX_TOOL_CALLS:
-                await status(
-                    f"Tool call limit ({self.valves.MAX_TOOL_CALLS}) reached.",
-                    done=True,
-                    level="warning",
-                )
-                break
-
-            # Execute tools (parallel when >1).
-            coros = [
-                self._execute_tool(
-                    call, tools, request, metadata, user, event_call=event_call
-                )
-                for call in tool_calls
-            ]
-            results = (
-                await asyncio.gather(*coros) if len(coros) > 1 else [await coros[0]]
-            )
-            tool_calls_executed += len(results)
-
-            chat_id = metadata.get("chat_id")
-            result_blocks: list[dict] = []
-            for call, (block, output, files, embeds, is_error) in zip(
-                tool_calls, results
-            ):
-                result_blocks.append(block)
-                ref = ""
-                if self.valves.PERSIST_TOOL_RESULTS and chat_id:
-                    ulid = generate_ulid()
-                    saved = await self.tool_result_store.save(
-                        chat_id,
-                        ulid,
-                        {
-                            "id": call["id"],
-                            "name": call["name"],
-                            "input": call["input"],
-                            "output": output,
-                            "is_error": is_error,
-                        },
-                    )
-                    if saved:
-                        ref = ulid
-                rendered = self._format_tool_result_block(
-                    call["id"],
-                    call["name"],
-                    call["input"],
-                    output,
-                    is_error,
-                    max_chars=self.valves.MAX_TOOL_RESULT_CHARS,
-                    ref=ref,
-                )
-                await emit_block(rendered)
-                if files:
-                    await emit({"type": "files", "data": {"files": files}})
-
-            # Append assistant tool_use turn + user tool_result turn.
-            payload["messages"].append(
-                {"role": "assistant", "content": self._message_to_api_blocks(message)}
-            )
-            payload["messages"].append({"role": "user", "content": result_blocks})
-            self._apply_cache_control(payload)
-
-        # Finalize. Open WebUI renders its own progress/completion UI, so we
-        # emit no routine status — only the terminal chat:completion signal.
-        consolidated = visible_text.strip()
-        if consolidated:
-            await replace(consolidated)
-        await emit(
-            {
-                "type": "chat:completion",
-                "data": {
-                    "choices": [{"finish_reason": "stop", "delta": {"content": ""}}],
-                    "done": True,
-                },
-            }
-        )
-        return consolidated
 
     @staticmethod
     def _stop_reason_suffix(message: Any, stop_reason: Optional[str]) -> str:

@@ -4,9 +4,9 @@ id: google_gemini
 author: Justin Kropp
 author_url: https://github.com/jrkropp
 description: Google Gemini API Manifold
-required_open_webui_version: 0.6.28
-requirements: google-genai~=2.8, pydantic~=2.13
-version: 0.1.0
+required_open_webui_version: 0.10.2
+requirements: google-genai~=2.8, openai~=2.41, tiktoken>=0.7, pydantic~=2.13
+version: 0.2.1
 license: MIT
 """
 
@@ -24,11 +24,12 @@ import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Iterable, Literal, Protocol
+from typing import Any, AsyncIterator, Iterable, Literal, Protocol
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from owui_manifolds.filters.context_runtime import prepare_context_for_pipe
 from owui_manifolds.shared.content import strip_details_blocks
 from owui_manifolds.shared.events import OpenWebUIRuntimeEvents
 from owui_manifolds.shared.ids import generate_ulid
@@ -53,7 +54,7 @@ _LOG_LEVELS: tuple[Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], ...
     "ERROR",
     "CRITICAL",
 )
-_DEFAULT_LOG_LEVEL = ((os.getenv("GLOBAL_LOG_LEVEL", "INFO") or "INFO").strip().upper())
+_DEFAULT_LOG_LEVEL = (os.getenv("GLOBAL_LOG_LEVEL", "INFO") or "INFO").strip().upper()
 if _DEFAULT_LOG_LEVEL not in _LOG_LEVELS:
     _DEFAULT_LOG_LEVEL = "INFO"
 
@@ -62,7 +63,9 @@ class PipeValves(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     API_KEY: str = Field(
-        default=((os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()),
+        default=(
+            (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+        ),
         description="Gemini Developer API key. Defaults to GOOGLE_API_KEY or GEMINI_API_KEY.",
     )
     BASE_URL: str | None = Field(
@@ -114,11 +117,11 @@ class PipeValves(BaseModel):
     )
     MAX_TOOL_CALLS: int = Field(
         default=30,
-        description="Maximum number of tool calls allowed in a single request.",
+        description="Deprecated compatibility setting; Open WebUI owns custom-function limits.",
     )
     MAX_FUNCTION_CALL_LOOPS: int = Field(
         default=100,
-        description="Maximum Gemini tool-call/model-call loops per request.",
+        description="Deprecated compatibility setting; Open WebUI owns custom-function loops.",
     )
     RESPONSE_MIME_TYPE: str | None = Field(
         default=None,
@@ -246,22 +249,25 @@ def _ensure_genai_sdk() -> tuple[Any, Any]:
 
 class HistoryStore(Protocol):
     async def save_items(
-        self, chat_key: dict[str, Any], message_id: str, items: list[dict[str, Any]], model_id: str
-    ) -> list[str]:
-        ...
+        self,
+        chat_key: dict[str, Any],
+        message_id: str,
+        items: list[dict[str, Any]],
+        model_id: str,
+    ) -> list[str]: ...
 
     async def load_items(
         self, chat_key: dict[str, Any], item_ids: list[str], model_id: str | None = None
-    ) -> dict[str, dict[str, Any]]:
-        ...
+    ) -> dict[str, dict[str, Any]]: ...
 
     async def load_assistant_message_item_payloads(
         self, chat_key: dict[str, Any], model_id: str | None = None
-    ) -> list[list[dict[str, Any]]]:
-        ...
+    ) -> list[list[dict[str, Any]]]: ...
 
 
-def _message_chain(messages_map: dict[str, dict[str, Any]], current_id: str | None) -> list[dict[str, Any]]:
+def _message_chain(
+    messages_map: dict[str, dict[str, Any]], current_id: str | None
+) -> list[dict[str, Any]]:
     if not messages_map or not current_id:
         return []
     current = messages_map.get(current_id)
@@ -314,7 +320,9 @@ class OpenWebUIHistoryStore(HistoryStore):
         root = chat.chat.setdefault("google_gemini_pipe", {"__v": self.VERSION})
         items_store = root.setdefault("items", {})
         messages_index = root.setdefault("messages_index", {})
-        bucket = messages_index.setdefault(message_id, {"role": "assistant", "done": True, "item_ids": []})
+        bucket = messages_index.setdefault(
+            message_id, {"role": "assistant", "done": True, "item_ids": []}
+        )
 
         now = int(time.time())
         created: list[str] = []
@@ -381,11 +389,21 @@ class OpenWebUIHistoryStore(HistoryStore):
             return []
 
         history = chat.chat.get("history", {}) if isinstance(chat.chat, dict) else {}
-        messages_map = history.get("messages", {}) if isinstance(history.get("messages"), dict) else {}
+        messages_map = (
+            history.get("messages", {})
+            if isinstance(history.get("messages"), dict)
+            else {}
+        )
         chain = _message_chain(messages_map, history.get("currentId"))
 
-        root = chat.chat.get("google_gemini_pipe", {}) if isinstance(chat.chat, dict) else {}
-        items_store = root.get("items", {}) if isinstance(root.get("items"), dict) else {}
+        root = (
+            chat.chat.get("google_gemini_pipe", {})
+            if isinstance(chat.chat, dict)
+            else {}
+        )
+        items_store = (
+            root.get("items", {}) if isinstance(root.get("items"), dict) else {}
+        )
 
         result: list[list[dict[str, Any]]] = []
         for message in chain:
@@ -452,12 +470,18 @@ def _owui_block_to_part(block: Any) -> types.Part:
         if image_url.startswith("data:"):
             header, _, data = image_url.partition(",")
             mime_type = header.split(";", 1)[0][5:] or "image/jpeg"
-            return types.Part.from_bytes(data=base64.b64decode(data), mime_type=mime_type)
-        return types.Part.from_uri(file_uri=image_url, mime_type=_guess_mime_type_from_url(image_url))
+            return types.Part.from_bytes(
+                data=base64.b64decode(data), mime_type=mime_type
+            )
+        return types.Part.from_uri(
+            file_uri=image_url, mime_type=_guess_mime_type_from_url(image_url)
+        )
 
     if kind == "input_image":
         image_url = block.get("image_url") or ""
-        return types.Part.from_uri(file_uri=image_url, mime_type=_guess_mime_type_from_url(image_url))
+        return types.Part.from_uri(
+            file_uri=image_url, mime_type=_guess_mime_type_from_url(image_url)
+        )
 
     return types.Part.from_text(text=json.dumps(block, ensure_ascii=False, default=str))
 
@@ -476,10 +500,13 @@ class HistoryManager:
         contents: list[types.Content] = []
         system_parts: list[str] = []
 
-        assistant_payload_groups = await self._store.load_assistant_message_item_payloads(
-            chat_key or {}, model_id=model_id
+        assistant_payload_groups = (
+            await self._store.load_assistant_message_item_payloads(
+                chat_key or {}, model_id=model_id
+            )
         )
         assistant_payload_index = 0
+        tool_names: dict[str, str] = {}
 
         for msg in messages:
             role = msg.get("role")
@@ -489,13 +516,58 @@ class HistoryManager:
                     system_parts.append(rendered)
                 continue
 
+            if role == "tool":
+                call_id = str(msg.get("tool_call_id") or "")
+                name = tool_names.get(call_id) or str(msg.get("name") or "")
+                if not name:
+                    continue
+                raw_result = msg.get("content", "")
+                if isinstance(raw_result, list):
+                    raw_result = "".join(
+                        str(block.get("text", ""))
+                        for block in raw_result
+                        if isinstance(block, dict)
+                        and block.get("type") in {"text", "input_text"}
+                    )
+                try:
+                    response_payload = (
+                        json.loads(raw_result)
+                        if isinstance(raw_result, str)
+                        else raw_result
+                    )
+                except (TypeError, ValueError):
+                    response_payload = raw_result
+                if not isinstance(response_payload, dict):
+                    response_payload = {"result": response_payload}
+                contents.append(
+                    types.Content(
+                        role="tool",
+                        parts=[
+                            types.Part(
+                                function_response=types.FunctionResponse(
+                                    id=call_id or None,
+                                    name=name,
+                                    response=response_payload,
+                                )
+                            )
+                        ],
+                    )
+                )
+                continue
+
             if role in {"user", "developer"}:
                 raw_content = msg.get("content") or []
                 if isinstance(raw_content, str):
                     raw_content = [{"type": "text", "text": raw_content}]
-                parts = [_owui_block_to_part(block) for block in raw_content if block is not None]
+                parts = [
+                    _owui_block_to_part(block)
+                    for block in raw_content
+                    if block is not None
+                ]
                 if role == "developer":
-                    parts = [types.Part.from_text(text="[Developer instruction]\n")] + parts
+                    parts = [
+                        types.Part.from_text(text="[Developer instruction]\n")
+                    ] + parts
                 if parts:
                     contents.append(types.Content(role="user", parts=parts))
                 continue
@@ -506,6 +578,37 @@ class HistoryManager:
             raw_content = msg.get("content") or ""
             if not isinstance(raw_content, str):
                 raw_content = str(raw_content)
+
+            tool_calls = [
+                tool_call
+                for tool_call in (msg.get("tool_calls") or [])
+                if isinstance(tool_call, dict)
+            ]
+            for tool_call in tool_calls:
+                function = tool_call.get("function") or {}
+                call_id = str(tool_call.get("id") or "")
+                name = str(function.get("name") or "")
+                if call_id and name:
+                    tool_names[call_id] = name
+
+            # Native Gemini Contents (including thought_signature) survive
+            # Open WebUI's loop in the reasoning_details extension.
+            sidecar_contents: list[types.Content] = []
+            for detail in msg.get("reasoning_details") or []:
+                if (
+                    not isinstance(detail, dict)
+                    or detail.get("type") != "google_gemini"
+                ):
+                    continue
+                for payload in detail.get("contents") or []:
+                    try:
+                        sidecar_contents.append(types.Content.model_validate(payload))
+                    except Exception:
+                        continue
+            if sidecar_contents:
+                contents.extend(sidecar_contents)
+                assistant_payload_index += 1
+                continue
 
             restored_payloads = (
                 assistant_payload_groups[assistant_payload_index]
@@ -524,11 +627,29 @@ class HistoryManager:
                     contents.extend(restored)
                     continue
 
+            parts: list[types.Part] = []
             visible = strip_details_blocks(raw_content).strip()
             if visible:
-                contents.append(types.Content(role="model", parts=[types.Part.from_text(text=visible)]))
+                parts.append(types.Part.from_text(text=visible))
+            for tool_call in tool_calls:
+                function = tool_call.get("function") or {}
+                name = str(function.get("name") or "")
+                arguments = function.get("arguments") or {}
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except ValueError:
+                        arguments = {}
+                if name:
+                    parts.append(
+                        types.Part.from_function_call(name=name, args=arguments)
+                    )
+            if parts:
+                contents.append(types.Content(role="model", parts=parts))
 
-        system_instruction = "\n\n".join(part for part in system_parts if part).strip() or None
+        system_instruction = (
+            "\n\n".join(part for part in system_parts if part).strip() or None
+        )
         return contents, system_instruction
 
     async def persist_contents_for_message(
@@ -591,6 +712,29 @@ class _StreamResult:
     grounding_response: "types.GenerateContentResponse | None"
 
 
+def _openai_stream_chunk(
+    model_id: str,
+    *,
+    delta: dict[str, Any] | None = None,
+    finish_reason: str | None = None,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    chunk: dict[str, Any] = {
+        "object": "chat.completion.chunk",
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta or {},
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    if usage:
+        chunk["usage"] = usage
+    return chunk
+
+
 class OpenWebUIToolRegistry:
     def __init__(self, registry: dict[str, Any] | None):
         self._definitions: dict[str, ToolDefinition] = {}
@@ -603,7 +747,11 @@ class OpenWebUIToolRegistry:
             if not isinstance(name, str) or not name:
                 continue
             raw_params = spec.get("parameters")
-            params: dict[str, Any] = raw_params if isinstance(raw_params, dict) else {"type": "object", "properties": {}}
+            params: dict[str, Any] = (
+                raw_params
+                if isinstance(raw_params, dict)
+                else {"type": "object", "properties": {}}
+            )
             self._definitions[name] = ToolDefinition(
                 name=name,
                 description=str(spec.get("description") or ""),
@@ -660,13 +808,17 @@ class OpenWebUIToolExecutor:
             return [await self._execute_one(call) for call in calls]
 
         seen: set[str] = set()
-        has_duplicates = any((call.name in seen) or (seen.add(call.name) or False) for call in calls)
+        has_duplicates = any(
+            (call.name in seen) or (seen.add(call.name) or False) for call in calls
+        )
         if has_duplicates:
             return [await self._execute_one(call) for call in calls]
 
         return list(await asyncio.gather(*(self._execute_one(call) for call in calls)))
 
-    async def _execute_direct(self, call: ToolCall, entry: dict[str, Any]) -> ToolResult:
+    async def _execute_direct(
+        self, call: ToolCall, entry: dict[str, Any]
+    ) -> ToolResult:
         shared = await dispatch_direct_tool(
             name=call.name,
             arguments=call.arguments,
@@ -768,13 +920,17 @@ def _normalize_model_id(raw_model_id: str, default_model: str) -> str:
 
 
 def _resolve_thinking_level(body: dict[str, Any], cfg: RuntimeConfig) -> str | None:
-    raw = body.get("thinking_level") or body.get("reasoning_effort") or cfg.THINKING_LEVEL
+    raw = (
+        body.get("thinking_level") or body.get("reasoning_effort") or cfg.THINKING_LEVEL
+    )
     if raw in (None, "", "disabled"):
         return None
     return str(raw).lower()
 
 
-def _build_thinking_config(body: dict[str, Any], cfg: RuntimeConfig) -> types.ThinkingConfig | None:
+def _build_thinking_config(
+    body: dict[str, Any], cfg: RuntimeConfig
+) -> types.ThinkingConfig | None:
     include_thoughts = body.get("include_thoughts")
     if include_thoughts is None:
         include_thoughts = cfg.INCLUDE_THOUGHTS
@@ -795,7 +951,9 @@ def _build_thinking_config(body: dict[str, Any], cfg: RuntimeConfig) -> types.Th
     return types.ThinkingConfig.model_validate(payload)
 
 
-def _build_safety_settings(body: dict[str, Any], cfg: RuntimeConfig) -> list[types.SafetySetting] | None:
+def _build_safety_settings(
+    body: dict[str, Any], cfg: RuntimeConfig
+) -> list[types.SafetySetting] | None:
     if cfg.USE_PERMISSIVE_SAFETY:
         categories = [
             types.HarmCategory.HARM_CATEGORY_HARASSMENT,
@@ -804,7 +962,9 @@ def _build_safety_settings(body: dict[str, Any], cfg: RuntimeConfig) -> list[typ
             types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
         ]
         return [
-            types.SafetySetting(category=category, threshold=types.HarmBlockThreshold.BLOCK_NONE)
+            types.SafetySetting(
+                category=category, threshold=types.HarmBlockThreshold.BLOCK_NONE
+            )
             for category in categories
         ]
 
@@ -830,7 +990,9 @@ def _tool_config(*, server_tools: bool = False) -> types.ToolConfig:
             function_calling_config=types.FunctionCallingConfig(mode="VALIDATED"),
             include_server_side_tool_invocations=True,
         )
-    return types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="AUTO"))
+    return types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+    )
 
 
 def _build_tools(
@@ -901,11 +1063,13 @@ async def _emit_grounding_sources(
                 continue
             seen.add(uri)
             title = web.title or uri
-            await events.source({
-                "source": {"name": title, "url": uri},
-                "document": [title],
-                "metadata": [{"source": uri}],
-            })
+            await events.source(
+                {
+                    "source": {"name": title, "url": uri},
+                    "document": [title],
+                    "metadata": [{"source": uri}],
+                }
+            )
     except Exception:
         pass
 
@@ -929,10 +1093,14 @@ def _format_server_tool_call_detail(part: Any) -> str:
             # Strip enum prefix e.g. "ToolType.GOOGLE_SEARCH_WEB" -> "GOOGLE_SEARCH_WEB"
             if "." in raw_type:
                 raw_type = raw_type.split(".")[-1]
-            display_name = _TOOL_TYPE_DISPLAY.get(raw_type, raw_type.lower() or "web_search")
+            display_name = _TOOL_TYPE_DISPLAY.get(
+                raw_type, raw_type.lower() or "web_search"
+            )
             args = getattr(tc, "args", {}) or {}
             call_id = str(getattr(tc, "id", "") or "")
-            escaped_args = html.escape(json.dumps(args, ensure_ascii=False, default=str))
+            escaped_args = html.escape(
+                json.dumps(args, ensure_ascii=False, default=str)
+            )
             return (
                 f'<details type="tool_calls" done="true" id="{html.escape(call_id)}" '
                 f'name="{html.escape(display_name)}" arguments="{escaped_args}" result="" files="" embeds="">\n'
@@ -957,7 +1125,9 @@ def _build_generation_config(
         "top_p": body.get("top_p"),
         "top_k": body.get("top_k"),
         "max_output_tokens": body.get("max_tokens"),
-        "stop_sequences": body.get("stop") if isinstance(body.get("stop"), list) else None,
+        "stop_sequences": (
+            body.get("stop") if isinstance(body.get("stop"), list) else None
+        ),
         "system_instruction": system_instruction,
         "thinking_config": _build_thinking_config(body, cfg),
         "safety_settings": _build_safety_settings(body, cfg),
@@ -966,20 +1136,28 @@ def _build_generation_config(
         "response_json_schema": body.get("response_json_schema"),
         "tools": tools,
         "tool_config": _tool_config(server_tools=server_tools) if tools else None,
-        "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
+        "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+            disable=True
+        ),
     }
     filtered = {key: value for key, value in payload.items() if value is not None}
     return types.GenerateContentConfig.model_validate(filtered)
 
 
 def _tool_response_content(result: ToolResult) -> types.Content:
-    part = types.Part.from_function_response(name=result.name, response=result.response_payload)
+    part = types.Part.from_function_response(
+        name=result.name, response=result.response_payload
+    )
     return types.Content(role="tool", parts=[part])
 
 
 def _format_tool_call_detail(result: ToolResult) -> str:
-    escaped_args = html.escape(json.dumps(result.arguments, ensure_ascii=False, default=str))
-    escaped_output = html.escape(json.dumps(result.response_payload, ensure_ascii=False, default=str))
+    escaped_args = html.escape(
+        json.dumps(result.arguments, ensure_ascii=False, default=str)
+    )
+    escaped_output = html.escape(
+        json.dumps(result.response_payload, ensure_ascii=False, default=str)
+    )
     error_attr = ' error="true"' if result.status != "ok" else ""
     return (
         f'<details type="tool_calls" done="true" id="{html.escape(result.call_id)}" '
@@ -1003,9 +1181,10 @@ def _build_http_options(cfg: RuntimeConfig) -> types.HttpOptions | None:
 async def _gemini_client(cfg: RuntimeConfig):
     _ensure_genai_sdk()
     http_options = _build_http_options(cfg)
-    async with genai.Client(api_key=cfg.API_KEY, http_options=http_options).aio as client:
+    async with genai.Client(
+        api_key=cfg.API_KEY, http_options=http_options
+    ).aio as client:
         yield client
-
 
 
 class Pipe:
@@ -1023,8 +1202,15 @@ class Pipe:
         self.history_manager = HistoryManager(self.history_store)
 
     async def pipes(self) -> list[dict[str, Any]]:
-        models = [model_id.strip() for model_id in (self.valves.MODEL_ID or "").split(",") if model_id.strip()]
-        return [{"id": model_id, "name": f"Google Gemini: {model_id}"} for model_id in models]
+        models = [
+            model_id.strip()
+            for model_id in (self.valves.MODEL_ID or "").split(",")
+            if model_id.strip()
+        ]
+        return [
+            {"id": model_id, "name": f"Google Gemini: {model_id}"}
+            for model_id in models
+        ]
 
     async def _resolve_tools(self, __tools__: Any) -> dict[str, Any]:
         if inspect.isawaitable(__tools__):
@@ -1114,7 +1300,10 @@ class Pipe:
                             await events.delta(block)
                     continue
 
-                if use_code_execution and getattr(part, "executable_code", None) is not None:
+                if (
+                    use_code_execution
+                    and getattr(part, "executable_code", None) is not None
+                ):
                     ec = part.executable_code
                     code = getattr(ec, "code", "") or ""
                     lang = str(getattr(ec, "language", "") or "python").lower()
@@ -1130,7 +1319,10 @@ class Pipe:
                         await events.delta(block)
                     continue
 
-                if use_code_execution and getattr(part, "code_execution_result", None) is not None:
+                if (
+                    use_code_execution
+                    and getattr(part, "code_execution_result", None) is not None
+                ):
                     cr = part.code_execution_result
                     output = getattr(cr, "output", "") or ""
                     outcome = str(getattr(cr, "outcome", "") or "")
@@ -1165,35 +1357,39 @@ class Pipe:
             grounding_response=grounding_response,
         )
 
-    async def _run_request(
+    async def _stream_native_once(
         self,
         *,
         body: dict[str, Any],
         cfg: RuntimeConfig,
         events: OpenWebUIRuntimeEvents,
         tool_registry: OpenWebUIToolRegistry,
-        tool_executor: OpenWebUIToolExecutor,
         metadata: dict[str, Any],
-        allow_tools: bool,
-        persist_history: bool,
-    ) -> str:
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Adapt one native Gemini stream for Open WebUI's tool-loop owner."""
+
         _ensure_genai_sdk()
         if not cfg.API_KEY:
-            raise ValueError("GOOGLE_API_KEY / GEMINI_API_KEY is not set")
+            yield {"error": {"message": "GOOGLE_API_KEY / GEMINI_API_KEY is not set"}}
+            return
 
-        model_id = _normalize_model_id(str(body.get("model") or ""), cfg.MODEL_ID.split(",", 1)[0].strip())
+        model_id = _normalize_model_id(
+            str(body.get("model") or ""), cfg.MODEL_ID.split(",", 1)[0].strip()
+        )
         if not model_id.startswith("gemini-"):
-            raise ValueError(f"Invalid Gemini model id: {model_id}")
+            yield {"error": {"message": f"Invalid Gemini model id: {model_id}"}}
+            return
 
         history_key = {"chat_id": metadata.get("chat_id"), "pipe_id": self.id}
-        contents, system_instruction = await self.history_manager.build_contents_from_messages(
-            messages=body.get("messages") or [],
-            chat_key=history_key,
-            model_id=model_id,
+        contents, system_instruction = (
+            await self.history_manager.build_contents_from_messages(
+                messages=body.get("messages") or [],
+                chat_key=history_key,
+                model_id=model_id,
+            )
         )
-
         use_search, use_maps, use_url_context, use_code_execution = (
-            _resolve_server_tools(cfg.SERVER_TOOL_MODE) if allow_tools else (False, False, False, False)
+            _resolve_server_tools(cfg.SERVER_TOOL_MODE)
         )
         has_server_tools = use_search or use_maps or use_url_context
         gemini_tools = _build_tools(
@@ -1202,7 +1398,7 @@ class Pipe:
             google_maps=use_maps,
             url_context=use_url_context,
             code_execution=use_code_execution,
-        ) if allow_tools else None
+        )
         config = _build_generation_config(
             body=body,
             cfg=cfg,
@@ -1211,97 +1407,183 @@ class Pipe:
             server_tools=has_server_tools,
         )
 
-        logger = _get_logger(cfg.LOG_LEVEL)
-        visible_blocks: list[str] = []
-        persisted_contents: list[types.Content] = []
-        tool_calls_executed = 0
-        final_text = ""
-        final_text_emitted = False
+        native_contents: list[dict[str, Any]] = []
+        custom_tool_calls = 0
+        grounding_response: types.GenerateContentResponse | None = None
+        usage: dict[str, Any] | None = None
 
-        async with _gemini_client(cfg) as client:
-            for loop_index in range(cfg.MAX_FUNCTION_CALL_LOOPS):
-                logger.debug("Gemini request loop=%s model=%s", loop_index + 1, model_id)
-                stream_result = await self._stream_response(
-                    client=client,
-                    model_id=model_id,
+        try:
+            async with _gemini_client(cfg) as client:
+                stream = await client.models.generate_content_stream(
+                    model=model_id,
                     contents=contents,
                     config=config,
-                    events=events,
-                    emit=True,
-                    use_code_execution=use_code_execution,
                 )
-                model_contents = stream_result.model_contents
-                visible_blocks.extend(stream_result.visible_blocks)
+                async for chunk in stream:
+                    if getattr(chunk, "usage_metadata", None) is not None:
+                        usage = chunk.usage_metadata.model_dump(
+                            mode="json", exclude_none=True
+                        )
+                    candidate = chunk.candidates[0] if chunk.candidates else None
+                    if (
+                        candidate is not None
+                        and candidate.grounding_metadata is not None
+                    ):
+                        grounding_response = chunk
+                    content = candidate.content if candidate else None
+                    if not content or not content.parts:
+                        continue
 
-                tool_calls = stream_result.tool_calls if allow_tools else []
+                    native_contents.append(_content_to_json(content))
+                    for part in content.parts:
+                        if part.thought and part.text:
+                            yield _openai_stream_chunk(
+                                model_id,
+                                delta={"reasoning_content": part.text},
+                            )
+                            continue
 
-                # Circulate each streamed chunk's Content back verbatim (including
-                # thought_signatures) so context is preserved across iterations.
-                # The chunks are the live SDK objects — no serialization round-trip
-                # strips thought_signature.  Do NOT add to persisted_contents here
-                # — cross-turn history only needs function_response items.
-                contents.extend(model_contents)
+                        if getattr(part, "function_call", None) is not None:
+                            function_call = part.function_call
+                            if not function_call.name:
+                                continue
+                            call_id = function_call.id or generate_ulid()
+                            yield _openai_stream_chunk(
+                                model_id,
+                                delta={
+                                    "tool_calls": [
+                                        {
+                                            "index": custom_tool_calls,
+                                            "id": call_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": function_call.name,
+                                                "arguments": json.dumps(
+                                                    function_call.args or {},
+                                                    ensure_ascii=False,
+                                                ),
+                                            },
+                                        }
+                                    ]
+                                },
+                            )
+                            custom_tool_calls += 1
+                            continue
 
-                if not tool_calls:
-                    persisted_contents.extend(model_contents)
-                    final_text = stream_result.final_text
-                    final_text_emitted = stream_result.final_text_emitted
-                    if has_server_tools and stream_result.grounding_response is not None:
-                        await _emit_grounding_sources(stream_result.grounding_response, events)
-                    break
+                        if getattr(part, "tool_call", None) is not None:
+                            block = _format_server_tool_call_detail(part)
+                            if block:
+                                yield _openai_stream_chunk(
+                                    model_id, delta={"content": block}
+                                )
+                            continue
 
-                if tool_calls_executed + len(tool_calls) > cfg.MAX_TOOL_CALLS:
-                    raise RuntimeError("Gemini exceeded MAX_TOOL_CALLS for this request")
+                        if (
+                            use_code_execution
+                            and getattr(part, "executable_code", None) is not None
+                        ):
+                            executable = part.executable_code
+                            code = getattr(executable, "code", "") or ""
+                            language = str(
+                                getattr(executable, "language", "") or "python"
+                            ).lower()
+                            yield _openai_stream_chunk(
+                                model_id,
+                                delta={"content": f"```{language}\n{code}\n```\n"},
+                            )
+                            continue
 
-                tool_results = await tool_executor.execute(tool_calls)
-                tool_calls_executed += len(tool_results)
+                        if (
+                            use_code_execution
+                            and getattr(part, "code_execution_result", None) is not None
+                        ):
+                            result = part.code_execution_result
+                            output = getattr(result, "output", "") or ""
+                            yield _openai_stream_chunk(
+                                model_id,
+                                delta={"content": f"```\n{output}\n```\n"},
+                            )
+                            continue
 
-                for result in tool_results:
-                    block = _format_tool_call_detail(result)
-                    visible_blocks.append(block)
-                    await events.delta(block)
-                    tool_content = _tool_response_content(result)
-                    contents.append(tool_content)
-                    persisted_contents.append(tool_content)
-            else:
-                # Loop exhausted without a text response — fall through to fallback below.
-                pass
+                        if part.text:
+                            yield _openai_stream_chunk(
+                                model_id, delta={"content": part.text}
+                            )
 
-            if not final_text and tool_calls_executed > 0:
-                fallback_config = _build_generation_config(
-                    body=body,
-                    cfg=cfg,
-                    system_instruction=system_instruction,
-                    tools=None,
-                    server_tools=False,
+            if custom_tool_calls:
+                # OWUI preserves reasoning_details when it converts its typed
+                # output back into assistant tool_calls for the next invocation.
+                yield _openai_stream_chunk(
+                    model_id,
+                    delta={
+                        "reasoning_details": [
+                            {
+                                "type": "google_gemini",
+                                "index": 0,
+                                "contents": native_contents,
+                            }
+                        ]
+                    },
                 )
-                fallback_result = await self._stream_response(
-                    client=client,
-                    model_id=model_id,
-                    contents=contents,
-                    config=fallback_config,
-                    events=events,
-                    emit=not final_text_emitted,
-                    use_code_execution=False,
-                )
-                visible_blocks.extend(fallback_result.visible_blocks)
-                persisted_contents.extend(fallback_result.model_contents)
-                final_text = fallback_result.final_text or final_text
-                if fallback_result.final_text_emitted:
-                    final_text_emitted = True
 
-        blocks_text = "".join(visible_blocks)
-        visible_text = (blocks_text + ("\n\n" if blocks_text and final_text else "") + final_text).strip()
-        if persist_history:
-            visible_text = await self.history_manager.persist_contents_for_message(
-                chat_key=history_key,
-                message_id=metadata.get("message_id"),
-                model_id=model_id,
-                contents=persisted_contents,
-                visible_text=visible_text,
+            if grounding_response is not None:
+                await _emit_grounding_sources(grounding_response, events)
+
+            yield _openai_stream_chunk(
+                model_id,
+                finish_reason="tool_calls" if custom_tool_calls else "stop",
+                usage=usage,
             )
-        await events.chat_completion({"content": visible_text, "done": True})
-        return visible_text
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _get_logger(cfg.LOG_LEVEL).exception("Gemini native stream failed")
+            yield {"error": {"message": str(exc), "type": type(exc).__name__}}
+
+    async def _run_task_request(
+        self,
+        *,
+        body: dict[str, Any],
+        cfg: RuntimeConfig,
+        metadata: dict[str, Any],
+    ) -> str:
+        """Run one native Gemini call for non-interactive OWUI tasks."""
+
+        _ensure_genai_sdk()
+        if not cfg.API_KEY:
+            raise ValueError("GOOGLE_API_KEY / GEMINI_API_KEY is not set")
+        model_id = _normalize_model_id(
+            str(body.get("model") or ""), cfg.MODEL_ID.split(",", 1)[0].strip()
+        )
+        history_key = {"chat_id": metadata.get("chat_id"), "pipe_id": self.id}
+        contents, system_instruction = (
+            await self.history_manager.build_contents_from_messages(
+                messages=body.get("messages") or [],
+                chat_key=history_key,
+                model_id=model_id,
+            )
+        )
+        config = _build_generation_config(
+            body=body,
+            cfg=cfg,
+            system_instruction=system_instruction,
+            tools=None,
+            server_tools=False,
+        )
+        text_parts: list[str] = []
+        async with _gemini_client(cfg) as client:
+            stream = await client.models.generate_content_stream(
+                model=model_id,
+                contents=contents,
+                config=config,
+            )
+            async for chunk in stream:
+                candidate = chunk.candidates[0] if chunk.candidates else None
+                content = candidate.content if candidate else None
+                for part in content.parts if content and content.parts else []:
+                    if part.text and not part.thought:
+                        text_parts.append(part.text)
+        return "".join(text_parts).strip()
 
     async def pipe(
         self,
@@ -1318,50 +1600,48 @@ class Pipe:
     ) -> Any:
         body = body or {}
         metadata = __metadata__ or {}
-        user_valves = self.UserValves.model_validate((__user__ or {}).get("valves") or {})
+        user_valves = self.UserValves.model_validate(
+            (__user__ or {}).get("valves") or {}
+        )
         cfg = merge_valves(self.valves, user_valves)
         events = OpenWebUIRuntimeEvents(__event_emitter__)
         logger = _get_logger(cfg.LOG_LEVEL)
 
         try:
+            if __task__ is None:
+                body = await prepare_context_for_pipe(
+                    body,
+                    model_id=_normalize_model_id(
+                        str(body.get("model") or ""),
+                        cfg.MODEL_ID.split(",", 1)[0].strip(),
+                    ),
+                    user=__user__,
+                    chat_id=metadata.get("chat_id"),
+                    metadata=metadata,
+                    event_emitter=__event_emitter__,
+                )
             resolved_tools = await self._resolve_tools(__tools__)
             registry = OpenWebUIToolRegistry(resolved_tools)
-            executor = OpenWebUIToolExecutor(
-                resolved_tools,
-                parallel=True,
-                event_call=__event_call__,
-                metadata=metadata,
-            )
 
             if __task__ is not None:
-                return await self._run_request(
+                return await self._run_task_request(
+                    body=__task_body__ or body,
+                    cfg=cfg,
+                    metadata=metadata,
+                )
+
+            if body.get("stream", False):
+                return self._stream_native_once(
                     body=body,
                     cfg=cfg,
                     events=events,
                     tool_registry=registry,
-                    tool_executor=executor,
                     metadata=metadata,
-                    allow_tools=False,
-                    persist_history=False,
                 )
 
-            result = await self._run_request(
-                body=body,
-                cfg=cfg,
-                events=events,
-                tool_registry=registry,
-                tool_executor=executor,
-                metadata=metadata,
-                allow_tools=True,
-                persist_history=True,
-            )
-            if body.get("stream", False):
-                async def _single_chunk() -> Any:
-                    if result:
-                        yield result
-
-                return _single_chunk()
-            return result
+            # Open WebUI task requests are handled above. Interactive chat is
+            # intentionally streaming so OWUI can own custom-function calls.
+            return "Error: Streaming is required for Gemini chat."
         except Exception as exc:
             logger.exception("Gemini pipe failed")
             await events.notification(f"Gemini request failed: {exc}", level="error")

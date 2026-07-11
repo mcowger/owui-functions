@@ -49,6 +49,20 @@ def test_dist_bundles_import_and_expose_pipe():
         pipe = module.Pipe()
         assert pipe is not None
 
+        body = {"model": "test", "messages": [{"role": "user", "content": "hi"}]}
+        metadata = {}
+        prepared = asyncio.run(
+            module.prepare_context_for_pipe(
+                body,
+                model_id="test",
+                user=None,
+                chat_id=None,
+                metadata=metadata,
+            )
+        )
+        assert prepared is body
+        assert module.context_is_prepared(body, metadata)
+
 
 def _install_context_open_webui_stubs(monkeypatch):
     open_webui = types.ModuleType("open_webui")

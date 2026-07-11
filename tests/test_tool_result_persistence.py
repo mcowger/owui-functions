@@ -5,9 +5,9 @@ Background: chat 98e30e94-34e0-4a4f-9af8-20e1ddeeebca grew to 5.5MB because
 _format_tool_result_block embedded full (unbounded) tool output into the
 rendered <details type="tool_calls" result="..."> attribute, and
 _parse_assistant_tool_calls resent that full text back to the API on every
-subsequent turn forever. The fix adds:
+subsequent turn forever. The legacy compatibility fix adds:
 
-  1. MAX_TOOL_RESULT_CHARS: truncates the rendered/resent result text.
+  1. Explicit preview limits for old rendered blocks.
   2. PERSIST_TOOL_RESULTS (default True): gates side-table persistence.
   3. ToolResultStore: full results are written to
      chat.chat["anthropic_pipe"]["items"][ulid] via a fake Chats model, and
@@ -71,8 +71,7 @@ class _FakeChats:
 
 
 def test_format_tool_result_block_truncates_long_output():
-    """A tool result longer than MAX_TOOL_RESULT_CHARS is truncated in the
-    rendered block, with a marker noting how much was cut."""
+    """An explicitly bounded legacy preview records that it was truncated."""
     huge_output = "x" * 10000
     rendered = Pipe._format_tool_result_block(
         "toolu_1", "ha_get_history", {}, huge_output, max_chars=100
@@ -104,12 +103,12 @@ def test_format_tool_result_block_omits_ref_when_absent():
     assert "ref=" not in rendered
 
 
-def test_run_streaming_turn_persists_full_result_and_truncates_visible():
+def test_legacy_store_persists_full_result_and_truncates_visible_preview():
     """End-to-end: a tool producing a huge result gets (a) a truncated
     visible block and (b) the full payload stored in the side-table under
     chat.chat['anthropic_pipe']['items'], referenced by the block's ref."""
     pipe = _make_pipe()
-    pipe.valves.MAX_TOOL_RESULT_CHARS = 50
+    preview_limit = 50
     fake_chats = _FakeChats()
     pipe.tool_result_store = anthropic_function.ToolResultStore(chats_model=fake_chats)
 
@@ -139,7 +138,7 @@ def test_run_streaming_turn_persists_full_result_and_truncates_visible():
         call["name"],
         call["input"],
         huge_output,
-        max_chars=pipe.valves.MAX_TOOL_RESULT_CHARS,
+        max_chars=preview_limit,
         ref=ulid,
     )
     assert "y" * 5000 not in rendered
@@ -296,10 +295,7 @@ class _FakeMessageStream:
 
 
 class _FakeClient:
-    """Mimics AsyncAnthropic enough for _run_streaming_turn: client.messages
-    is an object with a .stream(**kwargs) method. `stream_fn` lets callers
-    return a different fake stream per invocation (e.g. malformed JSON on
-    the first turn, a clean end_turn on the next)."""
+    """Mimics AsyncAnthropic enough for the native single-response adapter."""
 
     def __init__(self, stream_fn):
         self._stream_fn = stream_fn
@@ -335,18 +331,14 @@ class _CollectingEvents:
             self.notifications.append(event)
 
 
-def test_run_streaming_turn_recovers_from_malformed_tool_input_json():
-    """Regression: the Anthropic SDK parses streamed tool_use input JSON
-    incrementally via jiter(partial_mode=True). If the model/provider emits
-    syntactically invalid JSON (e.g. a dangling `"area_filter": ` with no
-    value before the block closes), jiter raises ValueError from inside the
-    async iterator, which used to propagate uncaught and kill the whole
-    turn ("Error: expected value at line 1 column 48"). The pipe should
-    instead log and fall back to the partial snapshot, still executing the
-    (partially-parsed) tool call rather than crashing."""
-    pipe = _make_pipe()
-    pipe.valves.PERSIST_TOOL_RESULTS = False
+def test_native_stream_recovers_malformed_tool_input_without_executing_it():
+    """Malformed partial tool JSON still returns a tool call to Open WebUI.
 
+    The Anthropic adapter owns only one native provider response. It must use
+    the SDK's final partial snapshot, emit the recovered tool call, and leave
+    execution to Open WebUI rather than invoking the callable itself.
+    """
+    pipe = _make_pipe()
     executed_with: dict = {}
 
     async def fake_tool(domain_filter=None, area_filter=None):
@@ -354,53 +346,42 @@ def test_run_streaming_turn_recovers_from_malformed_tool_input_json():
         executed_with["area_filter"] = area_filter
         return "ok"
 
-    tools = {"ha_ha_search": {"callable": fake_tool}}
-    client_tool_names = {"ha_ha_search"}
-
-    # Partial input as left behind by jiter right before the malformed
-    # delta: only the fields parsed before the crash are present.
     tool_block = _FakeToolUseBlock(
         "toolu_1", "ha_ha_search", {"domain_filter": "automation"}
     )
     final_message = _FakeFinalMessage([tool_block], stop_reason="tool_use")
+    calls = {"count": 0}
 
+    def stream_fn(**kwargs):
+        calls["count"] += 1
+        return _FakeMessageStream(final_message)
+
+    pipe._make_client = lambda api_key: _FakeClient(stream_fn)
     events = _CollectingEvents()
 
     async def run():
-        # Cap the loop at 1 iteration's worth of tool execution by making the
-        # second turn (after tool results are appended) return no tool_use.
-        call_count = {"n": 0}
+        return [
+            chunk
+            async for chunk in pipe._stream_native_once(
+                payload={"model": "claude-test", "messages": []},
+                client_tool_names={"ha_ha_search"},
+                api_key="test-key",
+                emit=events.emit,
+            )
+        ]
 
-        def stream_fn(**kwargs):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                return _FakeMessageStream(final_message)
-            return _FakeMessageStream(_FakeFinalMessage([], stop_reason="end_turn"))
+    chunks = asyncio.run(run())
 
-        pipe._make_client = lambda api_key: _FakeClient(stream_fn)
-
-        return await pipe._run_streaming_turn(
-            payload={"messages": []},
-            client_tool_names=client_tool_names,
-            api_key="test-key",
-            tools=tools,
-            metadata={"chat_id": "chat-1"},
-            user={},
-            request=None,
-            emit=events.emit,
-            status=events.status,
-            delta=events.delta,
-            replace=events.replace,
-        )
-
-    asyncio.run(run())
-
-    # The tool ran with whatever partial input jiter had parsed before the
-    # crash — area_filter defaulted to None rather than the call failing.
-    assert executed_with["domain_filter"] == "automation"
-    assert executed_with["area_filter"] is None
-    # No uncaught exception reached _handle_error / the top-level "Error: ..."
-    # response path.
+    assert calls["count"] == 1
+    assert executed_with == {}
+    tool_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk.get("choices", [{}])[0].get("delta", {}).get("tool_calls")
+    )
+    tool_call = tool_chunk["choices"][0]["delta"]["tool_calls"][0]
+    assert tool_call["id"] == "toolu_1"
+    assert '"domain_filter": "automation"' in tool_call["function"]["arguments"]
     assert not events.notifications
 
 

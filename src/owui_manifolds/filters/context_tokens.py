@@ -1,5 +1,6 @@
 """Token counting and budget helpers for the context window manager."""
 
+import json
 from typing import Any, Dict, List, Optional
 
 from owui_manifolds.filters.context_constants import MESSAGE_OVERHEAD_TOKENS
@@ -58,9 +59,13 @@ class ContextTokenMixin:
 
     def extract_text_from_content(self, content) -> str:
         if isinstance(content, list):
-            return " ".join(
-                item.get("text", "") for item in content if item.get("type") == "text"
-            )
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    parts.append(str(item))
+                elif item.get("type") in {"text", "input_text", "output_text"}:
+                    parts.append(str(item.get("text", "")))
+            return " ".join(part for part in parts if part)
         return str(content) if content else ""
 
     def count_message_tokens(self, message: dict) -> int:
@@ -70,19 +75,34 @@ class ContextTokenMixin:
         total = 0
         if isinstance(content, list):
             for item in content:
-                if item.get("type") == "text":
+                if not isinstance(item, dict):
+                    total += self.count_tokens(str(item))
+                elif item.get("type") in {"text", "input_text", "output_text"}:
                     total += self.count_tokens(item.get("text", ""))
-                elif item.get("type") == "image_url":
+                elif item.get("type") in {"image", "image_url", "input_image"}:
                     total += self.token_calculator.calculate_image_tokens()
+                else:
+                    total += self.count_tokens(
+                        json.dumps(item, ensure_ascii=False, default=str)
+                    )
         else:
             total = self.count_tokens(content)
+
+        # Open WebUI's recursive tool loop carries these outside ``content``.
+        # They consume provider context and must participate in budgeting.
+        for field in ("tool_calls", "reasoning_details", "output"):
+            value = message.get(field)
+            if value:
+                total += self.count_tokens(
+                    json.dumps(value, ensure_ascii=False, default=str)
+                )
         return total + MESSAGE_OVERHEAD_TOKENS
 
     def count_messages_tokens(self, messages: List[dict]) -> int:
         return sum(self.count_message_tokens(m) for m in messages)
 
-    def calculate_target_tokens(
-        self, model_name: str, current_user_tokens: int, context_target_percent: int
+    def calculate_request_input_budget(
+        self, model_name: str, context_target_percent: int
     ) -> int:
         safe_limit = self.get_model_token_limit(model_name)
         budget_limit = safe_limit * context_target_percent / 100
@@ -93,5 +113,13 @@ class ContextTokenMixin:
                 int(safe_limit * self.valves.response_buffer_percent / 100),
             ),
         )
-        target = budget_limit - current_user_tokens - response_buffer
+        return max(0, int(budget_limit - response_buffer))
+
+    def calculate_target_tokens(
+        self, model_name: str, current_user_tokens: int, context_target_percent: int
+    ) -> int:
+        request_budget = self.calculate_request_input_budget(
+            model_name, context_target_percent
+        )
+        target = request_budget - current_user_tokens
         return int(max(target, self.valves.min_target_tokens))
