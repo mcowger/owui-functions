@@ -1,4 +1,5 @@
 {
+  "$schema": "https://opencode.ai/config.json",
   "references": {
     "open-webui": {
       "repository": "open-webui/open-webui",
