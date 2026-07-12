@@ -1,0 +1,9 @@
+{
+  "references": {
+    "open-webui": {
+      "repository": "open-webui/open-webui",
+      "branch": "main",
+      "description": "Source code for open-webui to understand plugin, function and pipes interfaces, as well as UI behavior."
+    },
+  },
+}

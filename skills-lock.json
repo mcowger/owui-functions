@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "open-terminal-guide": {
+      "source": "mcowger/skills",
+      "sourceType": "github",
+      "skillPath": "open-terminal-guide/SKILL.md",
+      "computedHash": "f939f2e3505d0ee348812f63528ec2687a055a1be2836a7cc410676a0f779c12"
+    },
+    "open-webui-guide": {
+      "source": "mcowger/skills",
+      "sourceType": "github",
+      "skillPath": "open-webui-guide/SKILL.md",
+      "computedHash": "9c63f4dc9f218a026beb8f1a1ec79f64c085f6b5a379440191afd81cc9318f62"
+    }
+  }
+}
