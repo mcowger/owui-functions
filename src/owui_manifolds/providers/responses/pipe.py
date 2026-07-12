@@ -2636,11 +2636,10 @@ class ResponsesEngine:
         if event_type == "response.reasoning_summary_text.done":
             text = event.get("text")
             if text:
-                import html as _html
                 block = (
                     f'<details type="reasoning" done="true">\n'
                     f"<summary>Thought</summary>\n"
-                    f"{_html.escape(text)}\n"
+                    f"{text}\n"
                     f"</details>\n"
                 )
                 state.assistant_visible_text += block
