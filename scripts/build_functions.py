@@ -29,21 +29,6 @@ TARGETS: dict[str, Target] = {
         entry_module="owui_manifolds.filters.context",
         output=DIST_ROOT / "context.py",
     ),
-    "responses": Target(
-        name="responses",
-        entry_module="owui_manifolds.providers.responses.pipe",
-        output=DIST_ROOT / "responses.py",
-    ),
-    "gemini": Target(
-        name="gemini",
-        entry_module="owui_manifolds.providers.gemini.pipe",
-        output=DIST_ROOT / "gemini.py",
-    ),
-    "anthropic": Target(
-        name="anthropic",
-        entry_module="owui_manifolds.providers.anthropic.pipe",
-        output=DIST_ROOT / "anthropic_function.py",
-    ),
 }
 
 

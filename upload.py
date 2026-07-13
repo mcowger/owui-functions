@@ -4,15 +4,13 @@
 Reads connection details from .env (copy .env.example and fill in your values).
 
 Usage:
-    python upload.py                              # update dist/responses.py
-    python upload.py gemini                       # update dist/gemini.py (bare name)
-    python upload.py anthropic --create           # create dist/anthropic_function.py
-    python upload.py context                      # update dist/context.py
+    python upload.py                              # update dist/context.py
+    python upload.py context --create             # create dist/context.py
     python upload.py --file custom.py             # explicit filename
     python upload.py --id my_func_id              # override the function id
 
 The target may be given positionally or via --file, as a bare name
-("gemini"), a filename ("gemini.py"), or a path. Bare names get ".py"
+("context"), a filename ("context.py"), or a path. Bare names get ".py"
 appended automatically. Known targets read generated artifacts from dist/.
 """
 
@@ -37,21 +35,6 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).parent
 
 DEFAULTS = {
-    "responses.py": {
-        "id": "openai_responses_manifold",
-        "name": "OpenAI Responses API Manifold",
-        "description": "OpenAI Responses API Manifold",
-    },
-    "gemini.py": {
-        "id": "google_gemini_manifold",
-        "name": "Google Gemini API Manifold",
-        "description": "Google Gemini API Manifold",
-    },
-    "anthropic_function.py": {
-        "id": "anthropic_pipe",
-        "name": "Anthropic API Manifold",
-        "description": "Anthropic API Manifold",
-    },
     "context.py": {
         "id": "context_window_manager_simplified",
         "name": "🚀 Context Window Manager (Simplified)",
@@ -63,9 +46,7 @@ DEFAULTS = {
 
 # Friendly shorthands -> actual filenames (bare names get ".py" appended
 # unless matched here first).
-ALIASES = {
-    "anthropic": "anthropic_function.py",
-}
+ALIASES: dict[str, str] = {}
 
 
 def main() -> None:
@@ -75,7 +56,7 @@ def main() -> None:
         "target",
         nargs="?",
         default=None,
-        help="Function to upload: bare name (gemini), filename (gemini.py), or path. Default: responses",
+        help="Function to upload: bare name (context), filename (context.py), or path. Default: context",
     )
     parser.add_argument("--file", default=None, help="Function file to upload (alternative to positional target)")
     parser.add_argument("--id", default=None, help="Function id in Open WebUI")
@@ -85,7 +66,7 @@ def main() -> None:
     if args.target and args.file:
         sys.exit("Provide either a positional target or --file, not both.")
 
-    raw_target = args.target or args.file or "responses"
+    raw_target = args.target or args.file or "context"
     # Accept bare names ("gemini"), filenames ("gemini.py"), and paths.
     raw_target = ALIASES.get(raw_target, raw_target)
     if not raw_target.endswith(".py"):

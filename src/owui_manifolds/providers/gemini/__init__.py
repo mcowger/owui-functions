@@ -1,2 +1,0 @@
-"""Google Gemini manifold provider."""
-
