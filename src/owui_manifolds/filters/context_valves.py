@@ -125,6 +125,14 @@ class ContextValves(BaseModel):
     summary_max_tokens: int = Field(
         default=500, description="📝 Max output tokens for the overflow summary"
     )
+    fold_summary_max_tokens: int = Field(
+        default=4000,
+        description="📝 Max output tokens when folding pending history (or merging "
+        "existing blocks) into a persisted summary block. Separate ceiling from "
+        "summary_max_tokens, which caps per-chunk map-reduce calls - a fold can "
+        "summarize many messages at once and needs more room to avoid silent "
+        "truncation of the persisted block.",
+    )
     summary_input_max_tokens: int = Field(
         default=250000,
         ge=1000,

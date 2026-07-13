@@ -430,6 +430,7 @@ class ContextSummaryMixin:
         system_prompt: str,
         call_name: str,
         target_tokens: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> Optional[str]:
         client = self.get_api_client()
         if inspect.isawaitable(client):
@@ -437,13 +438,8 @@ class ContextSummaryMixin:
         if not client or not text.strip():
             return None
 
-        target_tokens = max(
-            64,
-            min(
-                int(target_tokens or self.valves.summary_max_tokens),
-                int(self.valves.summary_max_tokens),
-            ),
-        )
+        ceiling = int(max_output_tokens or self.valves.summary_max_tokens)
+        target_tokens = max(64, min(int(target_tokens or ceiling), ceiling))
 
         async def summarize_chunk(chunk: str, index: int, count: int) -> Optional[str]:
             user_content = (
@@ -463,6 +459,11 @@ class ContextSummaryMixin:
                         max_output_tokens=target_tokens,
                         store=False,
                     )
+                    if getattr(response, "status", None) == "incomplete":
+                        raise RuntimeError(
+                            f"{call_name} chunk {index}/{count} truncated by "
+                            "max_output_tokens"
+                        )
                     return response.output_text
 
                 response = await client.chat.completions.create(
@@ -473,7 +474,12 @@ class ContextSummaryMixin:
                     ],
                     max_tokens=target_tokens,
                 )
-                return response.choices[0].message.content
+                choice = response.choices[0]
+                if getattr(choice, "finish_reason", None) == "length":
+                    raise RuntimeError(
+                        f"{call_name} chunk {index}/{count} truncated by max_tokens"
+                    )
+                return choice.message.content
 
             result = await self.safe_api_call(
                 _call, f"{call_name} chunk {index}/{count}"
@@ -499,6 +505,7 @@ class ContextSummaryMixin:
                 system_prompt=system_prompt,
                 call_name=f"{call_name} reduction",
                 target_tokens=target_tokens,
+                max_output_tokens=ceiling,
             )
         return combined.strip() or None
 
@@ -506,12 +513,14 @@ class ContextSummaryMixin:
         self,
         excluded_messages: List[dict],
         target_tokens: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> Optional[str]:
         return await self._summarize_text(
             self._messages_to_text(excluded_messages),
             system_prompt=self.valves.summary_prompt,
             call_name="overflow summary",
             target_tokens=target_tokens,
+            max_output_tokens=max_output_tokens,
         )
 
     async def generate_tool_result_summary(
@@ -1056,6 +1065,14 @@ class ContextValves(BaseModel):
     summary_max_tokens: int = Field(
         default=500, description="📝 Max output tokens for the overflow summary"
     )
+    fold_summary_max_tokens: int = Field(
+        default=4000,
+        description="📝 Max output tokens when folding pending history (or merging "
+        "existing blocks) into a persisted summary block. Separate ceiling from "
+        "summary_max_tokens, which caps per-chunk map-reduce calls - a fold can "
+        "summarize many messages at once and needs more room to avoid silent "
+        "truncation of the persisted block.",
+    )
     summary_input_max_tokens: int = Field(
         default=250000,
         ge=1000,
@@ -1176,12 +1193,10 @@ class ContextWindowMixin:
         candidate fits the budget - used when the user opts to compress early
         via the warning-threshold prompt, ahead of the hard cap.
 
-        NOTE: `blocks` is intentionally left unbounded here - it is never capped
-        or merged. For a pathologically long-lived chat (many fold events) this
-        list would itself keep growing the token cost of the "blocks" section.
-        Deferred for now per explicit decision; revisit with e.g. a
-        max-block-count valve that merges the oldest two blocks if this ever
-        becomes a real problem in practice.
+        NOTE: `blocks` is never hard-capped in count, but each fold merges the
+        oldest two blocks into one before adding a new one, so the list grows
+        by at most one net entry per fold and old summaries get progressively
+        coarser rather than re-summarized in full every time.
         """
         n = len(history_messages)
         if n == 0:
@@ -1237,28 +1252,25 @@ class ContextWindowMixin:
         over_budget = self.count_messages_tokens(candidate) > budget
 
         if self.valves.enable_overflow_summary and (force or over_budget):
-            # Old state can contain one map summary per former 24K chunk. Merge
-            # those blocks first so persisted summaries cannot dominate context.
-            existing_block_messages = block_messages(blocks)
-            if existing_block_messages and (
-                len(blocks) > 1
-                or self.count_messages_tokens(existing_block_messages)
-                > int(self.valves.summary_max_tokens)
-            ):
+            fold_ceiling = int(self.valves.fold_summary_max_tokens)
+
+            # Merge only the oldest two blocks (not the whole list) so a
+            # long-lived chat's summaries get progressively coarser instead of
+            # being fully re-summarized - and re-degraded - on every fold.
+            if len(blocks) > 1:
+                oldest_two_messages = block_messages(blocks[:2])
                 base_tokens = self.count_messages_tokens(anchor + pending + recent)
                 block_target = max(
                     64,
-                    min(
-                        int(self.valves.summary_max_tokens),
-                        max(64, budget - base_tokens),
-                    ),
+                    min(fold_ceiling, max(64, budget - base_tokens)),
                 )
                 merged = await self.generate_overflow_summary(
-                    existing_block_messages,
+                    oldest_two_messages,
                     target_tokens=block_target,
+                    max_output_tokens=fold_ceiling,
                 )
                 if merged:
-                    blocks = [{"text": merged}]
+                    blocks = [{"text": merged}] + blocks[2:]
                     folded = True
 
             excluded = list(pending)
@@ -1273,9 +1285,7 @@ class ContextWindowMixin:
             minimum_units = 1 if preserve_latest_unit else 0
             while len(units) > minimum_units:
                 base = anchor + block_messages(blocks) + remaining_recent
-                projected = self.count_messages_tokens(base) + int(
-                    self.valves.summary_max_tokens
-                )
+                projected = self.count_messages_tokens(base) + fold_ceiling
                 if projected <= budget:
                     break
                 start, end = units[0]
@@ -1290,14 +1300,12 @@ class ContextWindowMixin:
                 )
                 summary_target = max(
                     64,
-                    min(
-                        int(self.valves.summary_max_tokens),
-                        max(64, budget - base_tokens),
-                    ),
+                    min(fold_ceiling, max(64, budget - base_tokens)),
                 )
                 summary_text = await self.generate_overflow_summary(
                     excluded,
                     target_tokens=summary_target,
+                    max_output_tokens=fold_ceiling,
                 )
                 if summary_text:
                     blocks = blocks + [{"text": summary_text}]

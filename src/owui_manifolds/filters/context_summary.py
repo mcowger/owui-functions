@@ -153,6 +153,7 @@ class ContextSummaryMixin:
         system_prompt: str,
         call_name: str,
         target_tokens: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> Optional[str]:
         client = self.get_api_client()
         if inspect.isawaitable(client):
@@ -160,13 +161,8 @@ class ContextSummaryMixin:
         if not client or not text.strip():
             return None
 
-        target_tokens = max(
-            64,
-            min(
-                int(target_tokens or self.valves.summary_max_tokens),
-                int(self.valves.summary_max_tokens),
-            ),
-        )
+        ceiling = int(max_output_tokens or self.valves.summary_max_tokens)
+        target_tokens = max(64, min(int(target_tokens or ceiling), ceiling))
 
         async def summarize_chunk(chunk: str, index: int, count: int) -> Optional[str]:
             user_content = (
@@ -186,6 +182,11 @@ class ContextSummaryMixin:
                         max_output_tokens=target_tokens,
                         store=False,
                     )
+                    if getattr(response, "status", None) == "incomplete":
+                        raise RuntimeError(
+                            f"{call_name} chunk {index}/{count} truncated by "
+                            "max_output_tokens"
+                        )
                     return response.output_text
 
                 response = await client.chat.completions.create(
@@ -196,7 +197,12 @@ class ContextSummaryMixin:
                     ],
                     max_tokens=target_tokens,
                 )
-                return response.choices[0].message.content
+                choice = response.choices[0]
+                if getattr(choice, "finish_reason", None) == "length":
+                    raise RuntimeError(
+                        f"{call_name} chunk {index}/{count} truncated by max_tokens"
+                    )
+                return choice.message.content
 
             result = await self.safe_api_call(
                 _call, f"{call_name} chunk {index}/{count}"
@@ -222,6 +228,7 @@ class ContextSummaryMixin:
                 system_prompt=system_prompt,
                 call_name=f"{call_name} reduction",
                 target_tokens=target_tokens,
+                max_output_tokens=ceiling,
             )
         return combined.strip() or None
 
@@ -229,12 +236,14 @@ class ContextSummaryMixin:
         self,
         excluded_messages: List[dict],
         target_tokens: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> Optional[str]:
         return await self._summarize_text(
             self._messages_to_text(excluded_messages),
             system_prompt=self.valves.summary_prompt,
             call_name="overflow summary",
             target_tokens=target_tokens,
+            max_output_tokens=max_output_tokens,
         )
 
     async def generate_tool_result_summary(

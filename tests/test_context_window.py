@@ -13,6 +13,7 @@ class ContextWindowHarness(ContextWindowMixin):
         self.valves = SimpleNamespace(
             enable_overflow_summary=True,
             summary_max_tokens=1_000,
+            fold_summary_max_tokens=4_000,
         )
         self.summarized_messages = []
 
@@ -20,7 +21,7 @@ class ContextWindowHarness(ContextWindowMixin):
         # The force path must fold even when the assembled candidate fits.
         return 0
 
-    async def generate_overflow_summary(self, messages, *, target_tokens):
+    async def generate_overflow_summary(self, messages, *, target_tokens, max_output_tokens=None):
         self.summarized_messages = messages
         return "Compressed middle"
 

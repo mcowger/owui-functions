@@ -117,7 +117,7 @@ def test_filter_compacts_oversized_tool_results_and_is_idempotent():
 
     manager.generate_tool_result_summary = summarize
 
-    async def summarize_history(messages, target_tokens=None):
+    async def summarize_history(messages, target_tokens=None, max_output_tokens=None):
         return "Summary of the original user instruction."
 
     manager.generate_overflow_summary = summarize_history
@@ -284,7 +284,7 @@ def test_hard_budget_can_fold_recent_messages_and_converge():
     )
     folded_sizes = []
 
-    async def summarize(messages, target_tokens=None):
+    async def summarize(messages, target_tokens=None, max_output_tokens=None):
         folded_sizes.append((len(messages), target_tokens))
         return "bounded history summary"
 
