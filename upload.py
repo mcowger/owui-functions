@@ -42,6 +42,12 @@ DEFAULTS = {
         "earliest and most recent messages verbatim and persistently, incrementally "
         "summarizing the middle.",
     },
+    "anthropic.py": {
+        "id": "anthropic_new",
+        "name": "Anthropic API Integration",
+        "description": "Anthropic API manifold pipe with tool calls, web search/fetch, "
+        "prompt caching, extended thinking, and code execution.",
+    },
 }
 
 # Friendly shorthands -> actual filenames (bare names get ".py" appended
@@ -73,7 +79,8 @@ def main() -> None:
         raw_target = f"{raw_target}.py"
 
     if raw_target in DEFAULTS:
-        function_file = SCRIPT_DIR / "dist" / raw_target
+        candidate = SCRIPT_DIR / "dist" / raw_target
+        function_file = candidate if candidate.exists() else SCRIPT_DIR / raw_target
     else:
         function_file = SCRIPT_DIR / raw_target
     if not function_file.exists():
